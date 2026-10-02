@@ -1,16 +1,20 @@
-name: Scheduled source verification
+name: Source verification and security scans
 on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
   schedule:
     - cron: "30 1 * * 0"
   workflow_dispatch:
 permissions:
   contents: read
-  security-events: write
 jobs:
   verify:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -28,7 +32,7 @@ jobs:
         language: ["python"]
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7.0.1
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4
@@ -52,10 +56,11 @@ jobs:
     name: Trivy Filesystem Scan
     runs-on: ubuntu-latest
     permissions:
+      contents: read
       security-events: write
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7.0.1
 
       - name: Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@master
