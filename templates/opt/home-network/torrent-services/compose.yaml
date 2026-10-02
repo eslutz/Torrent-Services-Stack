@@ -1,0 +1,660 @@
+name: torrent-services
+
+x-media-logging: &media-logging
+  driver: json-file
+  options:
+    max-size: 10m
+    max-file: "3"
+
+services:
+  gluetun:
+    image: ${GLUETUN_IMAGE:?GLUETUN_IMAGE must come from the fixed image lock}
+    container_name: gluetun
+    profiles:
+      - torrent-ready
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    ports:
+      - "${TORRENT_SERVICES_IP:-@@MEDIA_ADDRESS@@}:8080:8080"
+    env_file:
+      - ./config/gluetun/gluetun.env
+    secrets:
+      - wireguard_private_key
+    environment:
+      VPN_SERVICE_PROVIDER: protonvpn
+      VPN_TYPE: wireguard
+      PORT_FORWARD_ONLY: "on"
+      VPN_PORT_FORWARDING: "on"
+      VPN_PORT_FORWARDING_UP_COMMAND: >-
+        /bin/sh -c 'wget -O- -nv --retry-connrefused --post-data "json={\"listen_port\":{{PORT}},\"current_network_interface\":\"{{VPN_INTERFACE}}\",\"random_port\":false,\"upnp\":false}" http://127.0.0.1:8080/api/v2/app/setPreferences'
+      VPN_PORT_FORWARDING_DOWN_COMMAND: >-
+        /bin/sh -c 'wget -O- -nv --retry-connrefused --post-data "json={\"listen_port\":0,\"current_network_interface\":\"lo\"}" http://127.0.0.1:8080/api/v2/app/setPreferences'
+      FIREWALL_INPUT_PORTS: "8080"
+      HTTP_CONTROL_SERVER_ADDRESS: "127.0.0.1:8000"
+    volumes:
+      - ./data/gluetun:/gluetun
+      - ./config/gluetun/auth.toml:/gluetun/auth/config.toml:ro
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=1
+    logging: *media-logging
+    healthcheck:
+      test:
+        - CMD
+        - /gluetun-entrypoint
+        - healthcheck
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    security_opt:
+      - no-new-privileges:true
+
+  qbittorrent:
+    image: ${QBITTORRENT_IMAGE:?QBITTORRENT_IMAGE must come from the fixed image lock}
+    container_name: qbittorrent
+    profiles:
+      - torrent-ready
+    restart: unless-stopped
+    network_mode: service:gluetun
+    depends_on:
+      gluetun:
+        condition: service_healthy
+        restart: true
+    environment:
+      PUID: "@@MEDIA_ID@@"
+      PGID: "@@MEDIA_ID@@"
+      UMASK: "002"
+      TZ: @@TIMEZONE@@
+      WEBUI_PORT: "8080"
+    volumes:
+      - ./data/qbittorrent:/config
+      - type: bind
+        source: @@STAGING_MOUNT@@
+        target: /staging
+    tmpfs:
+      - /measure:size=3g,uid=@@MEDIA_ID@@,gid=@@MEDIA_ID@@,mode=0750
+    stop_grace_period: 2m
+    logging: *media-logging
+    healthcheck:
+      test:
+        - CMD
+        - /usr/bin/curl
+        - --fail
+        - --silent
+        - --show-error
+        - http://127.0.0.1:8080/api/v2/app/version
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+    security_opt:
+      - no-new-privileges:true
+
+  sonarr:
+    image: ${SONARR_IMAGE:?SONARR_IMAGE must come from the fixed image lock}
+    container_name: sonarr
+    profiles:
+      - torrent-ready
+    restart: unless-stopped
+    ports:
+      - "${TORRENT_SERVICES_IP:-@@MEDIA_ADDRESS@@}:8989:8989"
+    environment:
+      PUID: "@@MEDIA_ID@@"
+      PGID: "@@MEDIA_ID@@"
+      UMASK: "002"
+      TZ: @@TIMEZONE@@
+    volumes:
+      - ./data/sonarr:/config
+      - type: bind
+        source: @@LIBRARY_MOUNT@@
+        target: /data
+      - type: bind
+        source: @@STAGING_MOUNT@@
+        target: /staging
+    logging: *media-logging
+    healthcheck:
+      test:
+        - CMD
+        - /usr/bin/curl
+        - --fail
+        - --silent
+        - --show-error
+        - http://127.0.0.1:8989/ping
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+    security_opt:
+      - no-new-privileges:true
+
+  radarr:
+    image: ${RADARR_IMAGE:?RADARR_IMAGE must come from the fixed image lock}
+    container_name: radarr
+    profiles:
+      - torrent-ready
+    restart: unless-stopped
+    ports:
+      - "${TORRENT_SERVICES_IP:-@@MEDIA_ADDRESS@@}:7878:7878"
+    environment:
+      PUID: "@@MEDIA_ID@@"
+      PGID: "@@MEDIA_ID@@"
+      UMASK: "002"
+      TZ: @@TIMEZONE@@
+    volumes:
+      - ./data/radarr:/config
+      - type: bind
+        source: @@LIBRARY_MOUNT@@
+        target: /data
+      - type: bind
+        source: @@STAGING_MOUNT@@
+        target: /staging
+    logging: *media-logging
+    healthcheck:
+      test:
+        - CMD
+        - /usr/bin/curl
+        - --fail
+        - --silent
+        - --show-error
+        - http://127.0.0.1:7878/ping
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+    security_opt:
+      - no-new-privileges:true
+
+  prowlarr:
+    image: ${PROWLARR_IMAGE:?PROWLARR_IMAGE must come from the fixed image lock}
+    container_name: prowlarr
+    profiles:
+      - torrent-ready
+    restart: unless-stopped
+    ports:
+      - "${TORRENT_SERVICES_IP:-@@MEDIA_ADDRESS@@}:9696:9696"
+    environment:
+      PUID: "@@MEDIA_ID@@"
+      PGID: "@@MEDIA_ID@@"
+      UMASK: "002"
+      TZ: @@TIMEZONE@@
+    volumes:
+      - ./data/prowlarr:/config
+    logging: *media-logging
+    healthcheck:
+      test:
+        - CMD
+        - /usr/bin/curl
+        - --fail
+        - --silent
+        - --show-error
+        - http://127.0.0.1:9696/ping
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+    security_opt:
+      - no-new-privileges:true
+
+  bazarr:
+    image: ${BAZARR_IMAGE:?BAZARR_IMAGE must come from the fixed image lock}
+    container_name: bazarr
+    profiles:
+      - torrent-ready
+    restart: unless-stopped
+    ports:
+      - "${TORRENT_SERVICES_IP:-@@MEDIA_ADDRESS@@}:6767:6767"
+    environment:
+      PUID: "@@MEDIA_ID@@"
+      PGID: "@@MEDIA_ID@@"
+      UMASK: "002"
+      TZ: @@TIMEZONE@@
+    volumes:
+      - ./data/bazarr:/config
+      - type: bind
+        source: @@LIBRARY_MOUNT@@
+        target: /data
+    logging: *media-logging
+    healthcheck:
+      test:
+        - CMD
+        - /usr/bin/curl
+        - --fail
+        - --silent
+        - --show-error
+        - http://127.0.0.1:6767/api/system/ping
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+    security_opt:
+      - no-new-privileges:true
+
+  torarr:
+    image: ${TORARR_IMAGE:?TORARR_IMAGE must come from the fixed image lock}
+    container_name: torarr
+    profiles:
+      - torrent-ready
+    restart: unless-stopped
+    environment:
+      TZ: @@TIMEZONE@@
+      LOG_LEVEL: INFO
+      HEALTH_PORT: "9091"
+    env_file:
+      - path: @@CONFIG_ROOT@@/secrets/torarr.env
+        required: false
+    volumes:
+      - torarr-data:/var/lib/tor
+    ports:
+      - "${TORRENT_SERVICES_IP:-@@MEDIA_ADDRESS@@}:9091:9091"
+    logging: *media-logging
+    healthcheck:
+      test:
+        - CMD
+        - /usr/bin/wget
+        - -q
+        - --spider
+        - http://127.0.0.1:9091/health
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 300s
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  flaresolverr:
+    image: ${FLARESOLVERR_IMAGE:?FLARESOLVERR_IMAGE must come from the fixed image lock}
+    container_name: flaresolverr
+    profiles:
+      - torrent-ready
+    restart: unless-stopped
+    environment:
+      TZ: @@TIMEZONE@@
+      LOG_LEVEL: info
+      LANG: en_US.UTF-8
+    shm_size: 1gb
+    logging: *media-logging
+    healthcheck:
+      test:
+        - CMD
+        - /usr/bin/curl
+        - --fail
+        - --silent
+        - --output
+        - /dev/null
+        - http://127.0.0.1:8191/
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  seerr:
+    image: ${SEERR_IMAGE:?SEERR_IMAGE must come from the fixed image lock}
+    container_name: seerr
+    profiles:
+      - torrent-ready
+    restart: unless-stopped
+    user: "@@MEDIA_ID@@:@@MEDIA_ID@@"
+    ports:
+      - "${TORRENT_SERVICES_IP:-@@MEDIA_ADDRESS@@}:5055:5055"
+    environment:
+      PORT: "5055"
+      LOG_LEVEL: info
+      TZ: @@TIMEZONE@@
+      CONFIG_DIRECTORY: /app/config
+    volumes:
+      - ./data/seerr:/app/config
+    read_only: true
+    tmpfs:
+      - /tmp
+    logging: *media-logging
+    healthcheck:
+      test:
+        - CMD
+        - /usr/bin/wget
+        - -q
+        - --spider
+        - http://127.0.0.1:5055/api/v1/status
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  swiparr:
+    image: ${SWIPARR_IMAGE:?SWIPARR_IMAGE must come from the fixed image lock}
+    container_name: swiparr
+    profiles:
+      - torrent-ready
+    restart: unless-stopped
+    user: "@@MEDIA_ID@@:@@MEDIA_ID@@"
+    ports:
+      - "${TORRENT_SERVICES_IP:-@@MEDIA_ADDRESS@@}:4321:4321"
+    environment:
+      PROVIDER: jellyfin
+      PROVIDER_LOCK: "true"
+      JELLYFIN_URL: http://@@JELLYFIN_BACKEND_HOST@@:30013
+      JELLYFIN_PUBLIC_URL: https://@@JELLYFIN_PUBLIC_HOST@@
+      APP_PUBLIC_URL: https://@@SWIPARR_PUBLIC_HOST@@
+      USE_SECURE_COOKIES: "true"
+      ALLOW_PRIVATE_PROVIDER_URLS: "true"
+      TZ: @@TIMEZONE@@
+    env_file:
+      - path: @@CONFIG_ROOT@@/secrets/swiparr.env
+        required: false
+    volumes:
+      - ./data/swiparr:/app/data
+    logging: *media-logging
+    healthcheck:
+      test:
+        - CMD
+        - /usr/bin/curl
+        - --fail
+        - --silent
+        - --show-error
+        - http://127.0.0.1:4321/api/health
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  unpackerr:
+    image: ${UNPACKERR_IMAGE:?UNPACKERR_IMAGE must come from the fixed image lock}
+    container_name: unpackerr
+    profiles:
+      - torrent-integrations
+    restart: unless-stopped
+    user: "@@MEDIA_ID@@:@@MEDIA_ID@@"
+    depends_on:
+      sonarr:
+        condition: service_healthy
+      radarr:
+        condition: service_healthy
+    environment:
+      UN_SONARR_0_URL: http://sonarr:8989
+      UN_SONARR_0_PATHS_0: /staging/downloads/complete
+      UN_SONARR_0_PROTOCOLS: torrent
+      UN_RADARR_0_URL: http://radarr:7878
+      UN_RADARR_0_PATHS_0: /staging/downloads/complete
+      UN_RADARR_0_PROTOCOLS: torrent
+      UN_PARALLEL: "1"
+      UN_INTERVAL: 2m
+      UN_WEBSERVER_METRICS: "true"
+      UN_WEBSERVER_LISTEN_ADDR: 0.0.0.0:5656
+      TZ: @@TIMEZONE@@
+    env_file:
+      - path: @@CONFIG_ROOT@@/secrets/torrent-integrations.env
+        required: false
+    volumes:
+      - type: bind
+        source: @@STAGING_MOUNT@@
+        target: /staging
+    ports:
+      - "${TORRENT_SERVICES_IP:-@@MEDIA_ADDRESS@@}:5656:5656"
+    logging: *media-logging
+    healthcheck:
+      test:
+        - CMD
+        - /usr/bin/wget
+        - -q
+        - --spider
+        - http://127.0.0.1:5656/
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 90s
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  scraparr:
+    image: ${SCRAPARR_IMAGE:?SCRAPARR_IMAGE must come from the fixed image lock}
+    container_name: scraparr
+    profiles:
+      - torrent-integrations
+    restart: always
+    user: "@@MEDIA_ID@@:@@MEDIA_ID@@"
+    depends_on:
+      sonarr:
+        condition: service_healthy
+      radarr:
+        condition: service_healthy
+      prowlarr:
+        condition: service_healthy
+      bazarr:
+        condition: service_healthy
+    environment:
+      SONARR_URL: http://sonarr:8989
+      RADARR_URL: http://radarr:7878
+      PROWLARR_URL: http://prowlarr:9696
+      BAZARR_URL: http://bazarr:6767
+      TZ: @@TIMEZONE@@
+    env_file:
+      - path: @@CONFIG_ROOT@@/secrets/torrent-integrations.env
+        required: false
+    ports:
+      - "${TORRENT_SERVICES_IP:-@@MEDIA_ADDRESS@@}:7100:7100"
+    logging: *media-logging
+    healthcheck:
+      test:
+        - CMD
+        - /usr/bin/wget
+        - -q
+        - --spider
+        - http://127.0.0.1:7100/metrics
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 90s
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  qbittorrent-exporter:
+    image: ${QBITTORRENT_EXPORTER_IMAGE:?QBITTORRENT_EXPORTER_IMAGE must come from the fixed image lock}
+    container_name: qbittorrent-exporter
+    profiles:
+      - torrent-integrations
+    restart: always
+    user: "@@MEDIA_ID@@:@@MEDIA_ID@@"
+    depends_on:
+      qbittorrent:
+        condition: service_healthy
+    environment:
+      QBITTORRENT_BASE_URL: https://@@QBITTORRENT_PUBLIC_HOST@@
+      QBITTORRENT_USERNAME: admin
+      QBITTORRENT_PASSWORD_FILE: /run/secrets/qbittorrent-webui-password
+      QBITTORRENT_COOKIE_NAME: QBT_SID_8080
+      CERTIFICATE_AUTHORITY_PATH: /run/@@CLIENT_CA_FILENAME@@
+      EXPORTER_PORT: "8090"
+      LOG_LEVEL: INFO
+    secrets:
+      - qbittorrent-webui-password
+    volumes:
+      - @@CONFIG_ROOT@@/ca/@@CLIENT_CA_FILENAME@@:/run/@@CLIENT_CA_FILENAME@@:ro
+    ports:
+      - "${TORRENT_SERVICES_IP:-@@MEDIA_ADDRESS@@}:8090:8090"
+    logging: *media-logging
+    healthcheck:
+      test:
+        - CMD
+        - /usr/bin/wget
+        - -q
+        - --spider
+        - http://127.0.0.1:8090/healthz
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+
+  alloy:
+    image: ${ALLOY_IMAGE:?ALLOY_IMAGE must come from the fixed image lock}
+    container_name: alloy
+    profiles:
+      - monitoring-ready
+    restart: always
+    cgroup: host
+    user: "0:0"
+    command:
+      - run
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy-data
+      - /etc/alloy/config.alloy
+    ports:
+      - "${TORRENT_SERVICES_IP:-@@MEDIA_ADDRESS@@}:12345:12345"
+    volumes:
+      - ./config/alloy:/etc/alloy:ro
+      - ./data/alloy:/var/lib/alloy-data
+      - type: bind
+        source: /var/lib/docker/containers
+        target: /var/lib/docker/containers
+        read_only: true
+      - type: bind
+        source: /run/log/journal
+        target: /run/log/journal
+        read_only: true
+      - type: bind
+        source: /var/log/journal
+        target: /var/log/journal
+        read_only: true
+      - type: bind
+        source: /etc/machine-id
+        target: /etc/machine-id
+        read_only: true
+      - type: bind
+        source: /proc
+        target: /host/proc
+        read_only: true
+      - type: bind
+        source: @@STATE_ROOT@@/metrics
+        target: /host/metrics
+        read_only: true
+      - type: bind
+        source: /etc/os-release
+        target: /etc/os-release
+        read_only: true
+      - type: bind
+        source: /sys
+        target: /sys
+        read_only: true
+    healthcheck:
+      test:
+        - CMD
+        - /bin/bash
+        - -c
+        - exec 3<>/dev/tcp/127.0.0.1/12345 && printf 'GET /-/ready HTTP/1.0\r\n\r\n' >&3 && grep -q '200 OK' <&3
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  tdarr-server:
+    image: ${TDARR_SERVER_IMAGE:?TDARR_SERVER_IMAGE must come from the fixed image lock}
+    container_name: tdarr-server
+    profiles:
+      - media-conversion
+    restart: unless-stopped
+    ports:
+      - "${TORRENT_SERVICES_IP:-@@MEDIA_ADDRESS@@}:8265:8265"
+    environment:
+      PUID: "@@MEDIA_ID@@"
+      PGID: "@@MEDIA_ID@@"
+      UMASK_SET: "077"
+      TZ: @@TIMEZONE@@
+      serverIP: 0.0.0.0
+      serverPort: "8266"
+      webUIPort: "8265"
+      internalNode: "false"
+      inContainer: "true"
+      ffmpegVersion: "7"
+      auth: "true"
+      openBrowser: "false"
+      maxLogSizeMB: "10"
+    volumes:
+      - @@STATE_ROOT@@/tdarr/server:/app/server
+      - @@STATE_ROOT@@/tdarr/configs:/app/configs
+      - @@STATE_ROOT@@/tdarr/logs:/app/logs
+      - @@LIBRARY_MOUNT@@:/data:ro
+      - @@LIBRARY_MOUNT@@/.tdarr-work:/work:ro
+    logging: *media-logging
+    healthcheck:
+      test: [CMD, curl, -fsS, http://127.0.0.1:8266/api/v2/status]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 3m
+    security_opt:
+      - no-new-privileges:true
+
+  tdarr-lenovo-node:
+    image: ${TDARR_NODE_IMAGE:?TDARR_NODE_IMAGE must come from the fixed image lock}
+    container_name: tdarr-lenovo-node
+    profiles:
+      - media-conversion
+    restart: unless-stopped
+    depends_on:
+      - tdarr-server
+    cpus: 1.0
+    environment:
+      PUID: "@@MEDIA_ID@@"
+      PGID: "@@MEDIA_ID@@"
+      UMASK_SET: "077"
+      TZ: @@TIMEZONE@@
+      nodeName: @@NODE_NAME@@
+      serverURL: http://tdarr-server:8266
+      inContainer: "true"
+      ffmpegVersion: "7"
+      nodeType: mapped
+      startPaused: "true"
+      transcodecpuWorkers: "1"
+      transcodegpuWorkers: "0"
+      healthcheckcpuWorkers: "0"
+      healthcheckgpuWorkers: "0"
+      maxLogSizeMB: "10"
+    volumes:
+      - @@STATE_ROOT@@/tdarr/configs:/app/configs
+      - @@STATE_ROOT@@/tdarr/logs:/app/logs
+      - @@STATE_ROOT@@/tdarr/cache:/temp
+      - @@LIBRARY_MOUNT@@:/data:ro
+      - @@LIBRARY_MOUNT@@/.tdarr-work:/work
+      - @@APP_ROOT@@/tdarr-tools/dovi_tool-2.3.4:/tools/dovi_tool:ro
+    logging: *media-logging
+    security_opt:
+      - no-new-privileges:true
+
+secrets:
+  wireguard_private_key:
+    file: @@CONFIG_ROOT@@/secrets/proton-wireguard-private-key
+  qbittorrent-webui-password:
+    file: @@CONFIG_ROOT@@/secrets/qbittorrent-webui-password
+
+volumes:
+  torarr-data:
+    name: torrent-services_torarr-data
+    external: true

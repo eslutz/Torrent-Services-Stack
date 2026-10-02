@@ -1,0 +1,160 @@
+#!/bin/sh
+set -eu
+
+
+media_mount=@@LIBRARY_MOUNT@@
+media_host=@@LIBRARY_SERVER_HOST@@
+media_export=@@LIBRARY_EXPORT_PATH@@
+media_source=$media_host:$media_export
+staging_mount=@@STAGING_MOUNT@@
+staging_label=@@STAGING_LABEL@@
+staging_marker=$staging_mount/.home-network-staging
+downloads=$staging_mount/downloads
+marker=.home-network-ready
+key_file=@@CONFIG_ROOT@@/secrets/proton-wireguard-private-key
+image_lock=@@CONFIG_ROOT@@/image-locks/torrent-services.env
+compose_root=@@APP_ROOT@@/torrent-services
+services_address=@@MEDIA_ADDRESS@@
+
+fail() {
+  printf '%s\n' "$1" >&2
+  exit 69
+}
+
+media_identity=$(/usr/bin/getent passwd torrent-services) ||
+  fail 'torrent-services identity is absent'
+case "$media_identity" in
+  torrent-services:*:@@MEDIA_ID@@:@@MEDIA_ID@@:*:/nonexistent:/usr/sbin/nologin) ;;
+  *) fail 'torrent-services identity does not match locked UID/GID @@MEDIA_ID@@ policy' ;;
+esac
+[ "$(/usr/bin/getent passwd @@MEDIA_ID@@)" = "$media_identity" ] ||
+  fail 'UID @@MEDIA_ID@@ is not owned exactly by torrent-services'
+media_group=$(/usr/bin/getent group torrent-services) ||
+  fail 'torrent-services group is absent'
+[ "$media_group" = 'torrent-services:x:@@MEDIA_ID@@:' ] ||
+  fail 'torrent-services GID @@MEDIA_ID@@ has unexpected identity or members'
+[ "$(/usr/bin/getent group @@MEDIA_ID@@)" = "$media_group" ] ||
+  fail 'GID @@MEDIA_ID@@ is not owned exactly by torrent-services'
+[ "$(/usr/bin/id -G torrent-services)" = @@MEDIA_ID@@ ] ||
+  fail 'torrent-services has unexpected supplementary groups'
+[ "$(/usr/bin/passwd --status torrent-services | /usr/bin/awk '{print $2}')" = L ] ||
+  fail 'torrent-services password is not locked'
+
+media_test() {
+  /usr/bin/setpriv --reuid=@@MEDIA_ID@@ --regid=@@MEDIA_ID@@ --clear-groups -- /usr/bin/test "$@"
+}
+
+/sbin/ip -4 -o addr show | grep -Fq " $services_address/" ||
+  fail "Services address is not assigned: $services_address"
+
+[ -d /sys/module/wireguard ] ||
+  fail 'kernel WireGuard module is not loaded (modprobe wireguard; /etc/modules-load.d/home-network-media.conf)'
+[ -c /dev/net/tun ] || fail '/dev/net/tun is absent'
+
+ls "$media_mount" >/dev/null 2>&1 || true
+
+mountpoint -q "$media_mount" ||
+  fail "required TrueNAS mount is absent: $media_mount"
+filesystem=$(findmnt -n -o FSTYPE --target "$media_mount" | tail -n1)
+case "$filesystem" in
+  nfs|nfs4) ;;
+  *) fail "mount is not NFS: $media_mount ($filesystem)" ;;
+esac
+mounted_source=$(findmnt -n -o SOURCE --target "$media_mount" | tail -n1)
+case "$mounted_source" in
+  "$media_source") ;;
+  *":$media_export")
+    mounted_address=${mounted_source%%:*}
+    getent hosts "$media_host" | awk '{print $1}' | grep -qx "$mounted_address" ||
+      fail "mount source $mounted_source is not an address of $media_host"
+    ;;
+  *) fail "mount source is not the declared export: $media_mount ($mounted_source)" ;;
+esac
+[ -f "$media_mount/$marker" ] ||
+  fail "readiness marker is absent: $media_mount/$marker"
+media_test -r "$media_mount/$marker" ||
+  fail "torrent-services cannot read readiness marker: $media_mount/$marker"
+for library in movies shows family-movies family-shows; do
+  media_test -d "$media_mount/$library" ||
+    fail "library folder is absent or unreadable by torrent-services: $media_mount/$library"
+done
+
+mountpoint -q "$staging_mount" ||
+  fail "required staging drive is not mounted: $staging_mount"
+staging_fs=$(findmnt -n -o FSTYPE --target "$staging_mount")
+[ "$staging_fs" = ext4 ] ||
+  fail "staging mount is not ext4: $staging_mount ($staging_fs)"
+[ "$(findmnt -n -o SOURCE --target "$staging_mount")" = "$(readlink -f "/dev/disk/by-label/$staging_label" 2>/dev/null)" ] ||
+  fail "staging mount does not come from the $staging_label filesystem"
+[ -f "$staging_marker" ] ||
+  fail "staging marker is absent: $staging_marker (run seed-torrent-config)"
+media_test -r "$staging_marker" ||
+  fail "torrent-services cannot read staging marker: $staging_marker"
+for tree in "$downloads/incomplete" "$downloads/complete" "$staging_mount/torrents"; do
+  media_test -d "$tree" || fail "staging tree is absent: $tree (run seed-torrent-config)"
+  media_test -w "$tree" || fail "torrent-services cannot write: $tree"
+done
+
+[ -f "$key_file" ] || fail "Proton VPN WireGuard key file is absent: $key_file"
+[ "$(stat -c '%U:%G %a' "$key_file")" = 'root:root 600' ] ||
+  fail "Proton VPN key file must be root:root 0600: $key_file"
+[ "$(wc -l < "$key_file")" -le 1 ] || fail 'Proton VPN key file must hold one line'
+sed -n '1p' "$key_file" | tr -d '\n' | grep -Eq '^[A-Za-z0-9+/]{43}=$' ||
+  fail 'Proton VPN key file does not hold a 32-byte base64 WireGuard private key'
+
+[ -s "$image_lock" ] || fail "application image lock is absent: $image_lock"
+for variable in GLUETUN_IMAGE QBITTORRENT_IMAGE SONARR_IMAGE RADARR_IMAGE \
+  PROWLARR_IMAGE BAZARR_IMAGE UNPACKERR_IMAGE QBITTORRENT_EXPORTER_IMAGE \
+  SCRAPARR_IMAGE SEERR_IMAGE TORARR_IMAGE SWIPARR_IMAGE FLARESOLVERR_IMAGE; do
+  grep -Eq "^$variable=[a-z0-9./-]+@sha256:[a-f0-9]{64}$" "$image_lock" ||
+    fail "image lock entry is missing or not digest-pinned: $variable"
+done
+
+for config in config/gluetun/gluetun.env config/gluetun/auth.toml \
+  config/qbittorrent/qBittorrent.conf \
+  @@CUSTOM_DEFINITION@@; do
+  [ -r "$compose_root/$config" ] || fail "media configuration is absent: $config"
+done
+[ -x @@LIBEXEC_ROOT@@/wire-torrent-apps ] ||
+  fail 'wire-torrent-apps is absent; the integrations cannot be configured'
+
+for seeded in swiparr.env:AUTH_SECRET torarr.env:TOR_CONTROL_PASSWORD; do
+  file="@@CONFIG_ROOT@@/secrets/${seeded%%:*}"; name=${seeded#*:}
+  [ -s "$file" ] || fail "seeded secret is absent: $file (run seed-torrent-config)"
+  [ "$(stat -c '%U:%G %a' "$file")" = 'root:root 600' ] ||
+    fail "seeded secret must be root:root 0600: $file"
+  grep -Eq "^$name=.{16,}$" "$file" || fail "seeded secret has no usable $name: $file"
+done
+
+jellyfin_key=@@CONFIG_ROOT@@/secrets/jellyfin-api-key
+[ -f "$jellyfin_key" ] ||
+  fail "Jellyfin API key file is absent: $jellyfin_key (run seed-torrent-config)"
+[ "$(stat -c '%U:%G %a' "$jellyfin_key")" = 'root:root 600' ] ||
+  fail "Jellyfin API key file must be root:root 0600: $jellyfin_key"
+
+providers_env=@@CONFIG_ROOT@@/secrets/media-providers.env
+[ -f "$providers_env" ] ||
+  fail "provider credential file is absent: $providers_env (run seed-torrent-config)"
+[ "$(stat -c '%U:%G %a' "$providers_env")" = 'root:root 600' ] ||
+  fail "provider credential file must be root:root 0600: $providers_env"
+for name in @@INDEXER_CREDENTIAL_NAMES@@ \
+  ADDIC7ED_USERNAME ADDIC7ED_PASSWORD ADDIC7ED_COOKIES ADDIC7ED_USER_AGENT \
+  OPENSUBTITLESCOM_USERNAME OPENSUBTITLESCOM_PASSWORD; do
+  grep -Eq "^$name=" "$providers_env" ||
+    fail "provider credential file has no $name line: $providers_env"
+done
+grep -Eq '^WIREGUARD_IMPLEMENTATION=kernelspace$' "$compose_root/config/gluetun/gluetun.env" ||
+  fail 'gluetun.env must demand the kernel WireGuard implementation'
+
+runtime_conf="$compose_root/data/qbittorrent/qBittorrent/qBittorrent.conf"
+[ -f "$runtime_conf" ] || fail "qBittorrent configuration is not seeded: $runtime_conf (run seed-torrent-config)"
+[ "$(stat -c '%U:%G' "$runtime_conf")" = 'torrent-services:torrent-services' ] ||
+  fail "qBittorrent configuration must be owned by torrent-services: $runtime_conf"
+grep -Fxq 'WebUI\LocalHostAuth=false' "$runtime_conf" ||
+  fail 'qBittorrent configuration must bypass authentication on loopback for the Gluetun port-forward hook'
+grep -Fq 'Session\DiskIOType=SimplePreadPwrite' "$runtime_conf" ||
+  fail 'qBittorrent configuration must set DiskIOType=SimplePreadPwrite (the name, not a number)'
+grep -Fq 'WebUI\ServerDomains="' "$runtime_conf" ||
+  fail 'qBittorrent ServerDomains must be quoted; an unquoted ; starts an INI comment and drops every name after the first'
+
+printf 'torrent stack is ready\n'

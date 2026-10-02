@@ -1,0 +1,907 @@
+#!/bin/sh
+set -eu
+
+
+compose_root=@@APP_ROOT@@/torrent-services
+image_lock=@@CONFIG_ROOT@@/image-locks/torrent-services.env
+secrets=@@CONFIG_ROOT@@/secrets
+integrations_env=$secrets/torrent-integrations.env
+providers_env=$secrets/media-providers.env
+jellyfin_key_file=$secrets/jellyfin-api-key
+qbt_password_file=$secrets/qbittorrent-webui-password
+arr_analytics=@@LIBEXEC_ROOT@@/arr_analytics.py
+
+fail() { printf '%s\n' "$1" >&2; exit 69; }
+step() { printf '\n== %s\n' "$1"; }
+compose() {
+  docker compose -p torrent-services --env-file "$image_lock" \
+    -f "$compose_root/compose.yaml" "$@"
+}
+
+[ "$(id -u)" -eq 0 ] || fail 'run as root'
+case ${1:-} in
+  ''|--profiles-only) [ "$#" -le 1 ] || fail 'too many arguments' ;;
+  *) fail 'usage: wire-torrent-apps [--profiles-only]' ;;
+esac
+@@LIBEXEC_ROOT@@/verify-torrent-readiness >/dev/null ||
+  fail 'verify-torrent-readiness does not pass; fix that first'
+[ -x "$arr_analytics" ] || fail "*arr analytics enforcer is missing: $arr_analytics"
+for container in gluetun qbittorrent sonarr radarr prowlarr bazarr; do
+  state=$(docker inspect -f '{{.State.Health.Status}}' "$container" 2>/dev/null || echo absent)
+  [ "$state" = healthy ] || fail "$container is not healthy ($state); start the torrent-ready profile first"
+done
+torarr_state=$(docker inspect -f '{{.State.Health.Status}}' torarr 2>/dev/null || echo absent)
+flaresolverr_state=$(docker inspect -f '{{.State.Health.Status}}' flaresolverr 2>/dev/null || echo absent)
+for file in "$compose_root/data/sonarr/config.xml" "$compose_root/data/radarr/config.xml" \
+  "$compose_root/data/prowlarr/config.xml" "$compose_root/data/bazarr/config/config.yaml"; do
+  [ -r "$file" ] || fail "application configuration not yet written: $file"
+done
+[ -s "$qbt_password_file" ] || fail "qBittorrent password file is absent: $qbt_password_file"
+[ -f "$providers_env" ] ||
+  fail "provider credential file is absent: $providers_env (run seed-torrent-config)"
+
+api() {
+  container=$1; method=$2; url=$3; header=$4; key=$5; ctype=$6
+  { printf '%s\n' "$key"; cat; } | docker exec -i "$container" /bin/sh -c '
+    umask 077
+    IFS= read -r k
+    cat > /tmp/.wire.body
+    {
+      printf "%s\n" silent show-error "max-time = 30"
+      [ -n "'"$header"'" ] && printf "header = \"%s: %s\"\n" "'"$header"'" "$k"
+      printf "header = \"Content-Type: %s\"\n" "'"$ctype"'"
+      printf "header = \"Accept: application/json\"\n"
+    } > /tmp/.wire.cfg
+    if [ -s /tmp/.wire.body ]; then set -- --data-binary @/tmp/.wire.body; else set --; fi
+    /usr/bin/curl -K /tmp/.wire.cfg -X "'"$method"'" "$@" -o /tmp/.wire.out -w "%{http_code}" "'"$url"'" >/tmp/.wire.status 2>/dev/null || true
+    cat /tmp/.wire.status; echo; cat /tmp/.wire.out 2>/dev/null; rm -f /tmp/.wire.body /tmp/.wire.cfg /tmp/.wire.out /tmp/.wire.status'
+}
+status_of() { printf '%s\n' "$1" | sed -n '1p'; }
+body_of() { printf '%s\n' "$1" | sed '1d'; }
+expect() {
+  case "$(status_of "$1")" in
+    "$2"*) ;;
+    *) printf '%s: HTTP %s%s\n' "$3" "$(status_of "$1")" \
+         "$([ "$(status_of "$1")" = 000 ] && printf '%s' ' (no response: wrong port, or the service is not listening)')" >&2
+       exit 69 ;;
+  esac
+}
+py() { py_body=$1; shift; python3 -c "$py_body" "$@"; }
+
+ensure_password() {
+  file=$secrets/$1-webui-password
+  if [ -s "$file" ]; then
+    printf '%s password: unchanged\n' "$1"
+  else
+    ( umask 077; openssl rand -base64 24 | tr -d '\n' > "$file"; printf '\n' >> "$file" )
+    chown root:root "$file"; chmod 0600 "$file"
+    printf '%s password: created (%s)\n' "$1" "$file"
+  fi
+}
+
+arr_key() { sed -n 's:.*<ApiKey>\([^<]*\)</ApiKey>.*:\1:p' "$compose_root/data/$1/config.xml" | sed -n '1p'; }
+
+arr_forms_auth() {
+  app=$1; base=$2; key=$(arr_key "$app"); [ -n "$key" ] || fail "$app has no API key yet"
+  ensure_password "$app"
+  current=$(api "$app" GET "http://$base/config/host" X-Api-Key "$key" application/json </dev/null)
+  expect "$current" 2 "$app host config read"
+  if body_of "$current" | py '
+import json, sys
+c = json.load(sys.stdin)
+ok = (str(c.get("authenticationMethod", "")).lower() == "forms" and
+      str(c.get("authenticationRequired", "")).lower() == "enabled" and
+      c.get("analyticsEnabled") is False)
+sys.exit(0 if ok else 1)'; then
+    printf '%s authentication and analytics: unchanged (forms, required, analytics off)\n' "$app"
+    return
+  fi
+  put=$(body_of "$current" | "$arr_analytics" | PASSWORD_FILE="$secrets/$app-webui-password" py '
+import json, os, sys
+c = json.load(sys.stdin)
+password = open(os.environ["PASSWORD_FILE"]).read().strip()
+c.update({"authenticationMethod": "forms", "authenticationRequired": "enabled",
+          "username": "admin", "password": password, "passwordConfirmation": password})
+print(json.dumps(c))')
+  response=$(printf '%s' "$put" | api "$app" PUT "http://$base/config/host/1" X-Api-Key "$key" application/json)
+  unset put
+  expect "$response" 2 "$app host config write"
+  printf '%s authentication and analytics: asserted (forms, required, analytics off, user admin)\n' "$app"
+}
+
+arr_download_client() {
+  app=$1; base=$2; field=$3; category=$4; key=$(arr_key "$app")
+  existing=$(api "$app" GET "http://$base/downloadclient" X-Api-Key "$key" application/json </dev/null)
+  expect "$existing" 2 "$app download clients read"
+  state=$(body_of "$existing" | py '
+import json, sys
+client = next((c for c in json.load(sys.stdin) if c.get("implementation") == "QBittorrent"), None)
+print("absent" if client is None else client["id"])')
+  if [ "$state" != absent ]; then
+    client_id=$state
+    patched=$(body_of "$existing" | ID="$client_id" PASSWORD_FILE="$qbt_password_file" py '
+import json, os, sys
+client = next(c for c in json.load(sys.stdin) if c.get("id") == int(os.environ["ID"]))
+password = open(os.environ["PASSWORD_FILE"]).read().strip()
+client["removeCompletedDownloads"] = True
+for f in client.get("fields", []):
+    if f.get("name") == "password":
+        f["value"] = password
+    if f.get("name") == "username":
+        f["value"] = "admin"
+print(json.dumps(client))')
+    response=$(printf '%s' "$patched" |
+      api "$app" PUT "http://$base/downloadclient/$client_id" X-Api-Key "$key" application/json)
+    unset patched
+    expect "$response" 2 "$app download client update"
+    printf '%s download client: password and removal policy asserted\n' "$app"
+    return
+  fi
+  schema=$(api "$app" GET "http://$base/downloadclient/schema" X-Api-Key "$key" application/json </dev/null)
+  expect "$schema" 2 "$app download client schema"
+  payload=$(body_of "$schema" | FIELD="$field" CATEGORY="$category" PASSWORD_FILE="$qbt_password_file" py '
+import json, os, sys
+entry = next(e for e in json.load(sys.stdin) if e.get("implementation") == "QBittorrent")
+password = open(os.environ["PASSWORD_FILE"]).read().strip()
+values = {"host": "gluetun", "port": 8080, "useSsl": False, "username": "admin", "password": password,
+          os.environ["FIELD"]: os.environ["CATEGORY"]}
+for f in entry.get("fields", []):
+    if f.get("name") in values:
+        f["value"] = values[f["name"]]
+    if f.get("name") == "apiKey":
+        f["value"] = ""
+entry.update({"name": "qBittorrent", "enable": True, "protocol": "torrent", "priority": 1,
+              "removeCompletedDownloads": True, "removeFailedDownloads": True, "tags": []})
+entry.pop("id", None)
+print(json.dumps(entry))')
+  response=$(printf '%s' "$payload" | api "$app" POST "http://$base/downloadclient" X-Api-Key "$key" application/json)
+  unset payload
+  expect "$response" 2 "$app download client create"
+  printf '%s download client: created (gluetun:8080, category %s)\n' "$app" "$category"
+}
+
+arr_root_folders() {
+  app=$1; base=$2; key=$(arr_key "$app"); shift 2
+  existing=$(api "$app" GET "http://$base/rootfolder" X-Api-Key "$key" application/json </dev/null)
+  expect "$existing" 2 "$app root folders read"
+  for path in "$@"; do
+    if body_of "$existing" | ROOT="$path" py 'import json,os,sys; sys.exit(0 if any(r.get("path","").rstrip("/")==os.environ["ROOT"] for r in json.load(sys.stdin)) else 1)'; then
+      printf '%s root folder %s: unchanged\n' "$app" "$path"; continue
+    fi
+    response=$(printf '{"path":"%s"}' "$path" | api "$app" POST "http://$base/rootfolder" X-Api-Key "$key" application/json)
+    expect "$response" 2 "$app root folder $path"
+    printf '%s root folder %s: created\n' "$app" "$path"
+  done
+}
+
+prowlarr_wiring() {
+  key=$(arr_key prowlarr); base=127.0.0.1:9696/api/v1
+  apps=$(api prowlarr GET "http://$base/applications" X-Api-Key "$key" application/json </dev/null)
+  expect "$apps" 2 'prowlarr applications read'
+  for target in Sonarr:sonarr:8989 Radarr:radarr:7878; do
+    impl=${target%%:*}; rest=${target#*:}; host=${rest%%:*}; port=${rest#*:}
+    if body_of "$apps" | IMPL="$impl" py 'import json,os,sys; sys.exit(0 if any(a.get("implementation")==os.environ["IMPL"] for a in json.load(sys.stdin)) else 1)'; then
+      printf 'prowlarr application %s: unchanged\n' "$impl"; continue
+    fi
+    schema=$(api prowlarr GET "http://$base/applications/schema" X-Api-Key "$key" application/json </dev/null)
+    expect "$schema" 2 'prowlarr application schema'
+    payload=$(body_of "$schema" | IMPL="$impl" HOST="$host" PORT="$port" KEY_FILE="$compose_root/data/$host/config.xml" py '
+import json, os, re, sys
+entry = next(e for e in json.load(sys.stdin) if e.get("implementation") == os.environ["IMPL"])
+key = re.search(r"<ApiKey>([^<]*)</ApiKey>", open(os.environ["KEY_FILE"]).read()).group(1)
+values = {"prowlarrUrl": "http://prowlarr:9696", "baseUrl": "http://%s:%s" % (os.environ["HOST"], os.environ["PORT"]), "apiKey": key}
+for f in entry.get("fields", []):
+    if f.get("name") in values:
+        f["value"] = values[f["name"]]
+entry.update({"name": os.environ["IMPL"], "syncLevel": "fullSync", "tags": []})
+entry.pop("id", None)
+print(json.dumps(entry))')
+    response=$(printf '%s' "$payload" | api prowlarr POST "http://$base/applications" X-Api-Key "$key" application/json)
+    unset payload
+    expect "$response" 2 "prowlarr application $impl"
+    printf 'prowlarr application %s: created\n' "$impl"
+  done
+  tags=$(api prowlarr GET "http://$base/tag" X-Api-Key "$key" application/json </dev/null)
+  expect "$tags" 2 'prowlarr tags read'
+  tag_id=$(body_of "$tags" | py 'import json,sys; t=[x for x in json.load(sys.stdin) if x.get("label")=="tor-proxy"]; print(t[0]["id"] if t else "")')
+  legacy_id=$(body_of "$tags" | py 'import json,sys; t=[x for x in json.load(sys.stdin) if x.get("label")=="tor"]; print(t[0]["id"] if t else "")')
+  if [ -n "$tag_id" ]; then
+    printf 'prowlarr tag tor-proxy: unchanged (id %s)\n' "$tag_id"
+  elif [ -n "$legacy_id" ]; then
+    response=$(printf '{"id":%s,"label":"tor-proxy"}' "$legacy_id" |
+      api prowlarr PUT "http://$base/tag/$legacy_id" X-Api-Key "$key" application/json)
+    expect "$response" 2 'prowlarr tag rename'
+    tag_id=$legacy_id
+    printf 'prowlarr tag tor-proxy: renamed from tor (id %s, references preserved)\n' "$tag_id"
+  else
+    response=$(printf '{"label":"tor-proxy"}' | api prowlarr POST "http://$base/tag" X-Api-Key "$key" application/json)
+    expect "$response" 2 'prowlarr tag create'
+    tag_id=$(body_of "$response" | py 'import json,sys; print(json.load(sys.stdin)["id"])')
+    printf 'prowlarr tag tor-proxy: created (id %s)\n' "$tag_id"
+  fi
+  solver_tag_id=$(body_of "$tags" | py 'import json,sys; t=[x for x in json.load(sys.stdin) if x.get("label")=="solver"]; print(t[0]["id"] if t else "")')
+  if [ -n "$solver_tag_id" ]; then
+    printf 'prowlarr tag solver: unchanged (id %s)\n' "$solver_tag_id"
+  else
+    response=$(printf '{"label":"solver"}' | api prowlarr POST "http://$base/tag" X-Api-Key "$key" application/json)
+    expect "$response" 2 'prowlarr solver tag create'
+    solver_tag_id=$(body_of "$response" | py 'import json,sys; print(json.load(sys.stdin)["id"])')
+    printf 'prowlarr tag solver: created (id %s)\n' "$solver_tag_id"
+  fi
+  proxies=$(api prowlarr GET "http://$base/indexerproxy" X-Api-Key "$key" application/json </dev/null)
+  expect "$proxies" 2 'prowlarr indexer proxies read'
+  if body_of "$proxies" | py 'import json,sys; sys.exit(0 if any(p.get("name")=="Torarr" for p in json.load(sys.stdin)) else 1)'; then
+    printf 'prowlarr indexer proxy Torarr: unchanged\n'
+  elif [ "$torarr_state" != healthy ]; then
+    printf 'prowlarr indexer proxy Torarr: skipped (torarr is %s; re-run once it is healthy)\n' "$torarr_state"
+  else
+    schema=$(api prowlarr GET "http://$base/indexerproxy/schema" X-Api-Key "$key" application/json </dev/null)
+    expect "$schema" 2 'prowlarr indexer proxy schema'
+    payload=$(body_of "$schema" | TAG="$tag_id" py '
+import json, os, sys
+entry = next(e for e in json.load(sys.stdin) if e.get("implementation") == "Socks5")
+values = {"host": "torarr", "port": 9050, "username": "", "password": ""}
+for f in entry.get("fields", []):
+    if f.get("name") in values:
+        f["value"] = values[f["name"]]
+entry.update({"name": "Torarr", "tags": [int(os.environ["TAG"])]})
+entry.pop("id", None)
+print(json.dumps(entry))')
+    response=$(printf '%s' "$payload" | api prowlarr POST "http://$base/indexerproxy" X-Api-Key "$key" application/json)
+    expect "$response" 2 'prowlarr indexer proxy create'
+    printf 'prowlarr indexer proxy Torarr: created (socks5 torarr:9050, tag tor-proxy)\n'
+  fi
+  if body_of "$proxies" | py 'import json,sys; sys.exit(0 if any(p.get("name")=="FlareSolverr" for p in json.load(sys.stdin)) else 1)'; then
+    printf 'prowlarr indexer proxy FlareSolverr: unchanged\n'
+  elif [ "$flaresolverr_state" != healthy ]; then
+    printf 'prowlarr indexer proxy FlareSolverr: skipped (flaresolverr is %s; re-run once it is healthy)\n' "$flaresolverr_state"
+  else
+    schema=$(api prowlarr GET "http://$base/indexerproxy/schema" X-Api-Key "$key" application/json </dev/null)
+    expect "$schema" 2 'prowlarr indexer proxy schema'
+    payload=$(body_of "$schema" | TAG="$solver_tag_id" py '
+import json, os, sys
+entry = next(e for e in json.load(sys.stdin) if e.get("implementation") == "FlareSolverr")
+values = {"host": "http://flaresolverr:8191/", "requestTimeout": 180}
+for f in entry.get("fields", []):
+    if f.get("name") in values:
+        f["value"] = values[f["name"]]
+entry.update({"name": "FlareSolverr", "tags": [int(os.environ["TAG"])]})
+entry.pop("id", None)
+print(json.dumps(entry))')
+    response=$(printf '%s' "$payload" | api prowlarr POST "http://$base/indexerproxy" X-Api-Key "$key" application/json)
+    expect "$response" 2 'prowlarr FlareSolverr proxy create'
+    printf 'prowlarr indexer proxy FlareSolverr: created (flaresolverr:8191, tag solver)\n'
+  fi
+}
+
+arr_naming() {
+  app=$1; base=$2; key=$(arr_key "$app")
+  desired=$(cat)
+  current=$(api "$app" GET "http://$base/config/naming" X-Api-Key "$key" application/json </dev/null)
+  expect "$current" 2 "$app naming read"
+  if body_of "$current" | DESIRED="$desired" py '
+import json, os, sys
+current = json.load(sys.stdin)
+sys.exit(0 if all(current.get(k) == v for k, v in json.loads(os.environ["DESIRED"]).items()) else 1)'; then
+    printf '%s naming: unchanged\n' "$app"
+    return
+  fi
+  payload=$(body_of "$current" | DESIRED="$desired" py '
+import json, os, sys
+config = json.load(sys.stdin)
+config.update(json.loads(os.environ["DESIRED"]))
+print(json.dumps(config))')
+  response=$(printf '%s' "$payload" | api "$app" PUT "http://$base/config/naming/1" X-Api-Key "$key" application/json)
+  expect "$response" 2 "$app naming write"
+  after=$(api "$app" GET "http://$base/config/naming" X-Api-Key "$key" application/json </dev/null)
+  expect "$after" 2 "$app naming read back"
+  body_of "$after" | DESIRED="$desired" py '
+import json, os, sys
+current = json.load(sys.stdin)
+bad = [(k, current.get(k), v) for k, v in json.loads(os.environ["DESIRED"]).items() if current.get(k) != v]
+for k, got, want in bad:
+    print("%s naming not applied: %s is %r, expected %r" % ("'"$app"'", k, got, want), file=sys.stderr)
+sys.exit(1 if bad else 0)' || fail "$app naming did not take"
+  printf '%s naming: asserted (renaming on, library convention)\n' "$app"
+}
+
+profiles_helper=@@LIBEXEC_ROOT@@/arr-profiles
+profiles_config=$compose_root/config/arr-profiles
+arr_profile_specs() {
+  cat "$profiles_config/quality-profiles.json"
+}
+
+arr_fetch() {
+  response=$(api "$1" GET "http://$2/$4" X-Api-Key "$3" application/json </dev/null)
+  expect "$response" 2 "$1 $4 read"
+  body_of "$response" > "$5"
+}
+
+arr_apply_actions() {
+  while IFS= read -r action; do
+    [ -n "$action" ] || continue
+    fields=$(printf '%s' "$action" | py '
+import json, sys
+action = json.load(sys.stdin)
+print(action["change"])
+print(action.get("method") or "-")
+print(action.get("path") or "-")
+print(action["name"])')
+    change=$(printf '%s\n' "$fields" | sed -n '1p')
+    verb=$(printf '%s\n' "$fields" | sed -n '2p')
+    target=$(printf '%s\n' "$fields" | sed -n '3p')
+    label=$(printf '%s\n' "$fields" | sed -n '4p')
+    if [ "$change" = unchanged ]; then
+      printf '%s %s %s: unchanged\n' "$1" "$4" "$label"
+      continue
+    fi
+    case $verb in POST|PUT) ;; *) fail "$1 $4 $label: refusing method $verb" ;; esac
+    response=$(printf '%s' "$action" |
+      py 'import json, sys; print(json.dumps(json.load(sys.stdin)["body"]))' |
+      api "$1" "$verb" "http://$2$target" X-Api-Key "$3" application/json)
+    expect "$response" 2 "$1 $4 $label $change"
+    printf '%s %s %s: %sd\n' "$1" "$4" "$label" "$change"
+  done
+}
+
+arr_media_profiles() {
+  app=$1; base=$2; key=$(arr_key "$app")
+  declared=$profiles_config/$app-custom-formats.json
+  [ -x "$profiles_helper" ] || fail "arr-profiles is not installed at $profiles_helper"
+  [ -r "$declared" ] || fail "the declared custom formats are not installed at $declared"
+  [ -r "$profiles_config/local-custom-formats.json" ] || fail 'local custom formats are not installed'
+  [ -r "$profiles_config/quality-profiles.json" ] || fail 'resolution profile policy is not installed'
+  work=$(mktemp -d)
+  arr_profile_specs > "$work/specs.json"
+  py 'import json, sys
+vendor = json.load(open(sys.argv[1]))
+local = json.load(open(sys.argv[2]))
+print(json.dumps({"formats": vendor["formats"] + local["formats"]}))' \
+    "$declared" "$profiles_config/local-custom-formats.json" > "$work/declared.json"
+
+  arr_fetch "$app" "$base" "$key" customformat "$work/formats.json"
+  arr_fetch "$app" "$base" "$key" customformat/schema "$work/format-schema.json"
+  "$profiles_helper" plan-formats --declared "$work/declared.json" --live "$work/formats.json" \
+    --schema "$work/format-schema.json" > "$work/format-actions" ||
+    fail "$app custom formats: the declaration cannot be applied"
+  arr_apply_actions "$app" "$base" "$key" 'custom format' < "$work/format-actions"
+  arr_fetch "$app" "$base" "$key" customformat "$work/formats.json"
+  "$profiles_helper" verify-formats --declared "$work/declared.json" --live "$work/formats.json" \
+    --schema "$work/format-schema.json" || fail "$app custom formats did not take"
+
+  arr_fetch "$app" "$base" "$key" qualityprofile "$work/profiles.json"
+  arr_fetch "$app" "$base" "$key" qualityprofile/schema "$work/profile-schema.json"
+  "$profiles_helper" plan-profile --app "$app" --specs "$work/specs.json" \
+    --formats "$work/formats.json" --profiles "$work/profiles.json" \
+    --schema "$work/profile-schema.json" > "$work/profile-actions" ||
+    fail "$app quality profile: the declaration cannot be applied"
+  arr_apply_actions "$app" "$base" "$key" 'quality profile' < "$work/profile-actions"
+  arr_fetch "$app" "$base" "$key" qualityprofile "$work/profiles.json"
+  "$profiles_helper" verify-profile --app "$app" --specs "$work/specs.json" \
+    --formats "$work/formats.json" --profiles "$work/profiles.json" \
+    --schema "$work/profile-schema.json" || fail "$app quality profile did not take"
+  rm -rf "$work"
+}
+
+prowlarr_indexer_specs() {
+  cat <<'SPECS'
+@@INDEXER_POLICY@@
+SPECS
+}
+
+prowlarr_indexers() {
+  key=$(arr_key prowlarr); base=127.0.0.1:9696/api/v1
+  existing=$(api prowlarr GET "http://$base/indexer" X-Api-Key "$key" application/json </dev/null)
+  expect "$existing" 2 'prowlarr indexers read'
+  schema=$(api prowlarr GET "http://$base/indexer/schema" X-Api-Key "$key" application/json </dev/null)
+  expect "$schema" 2 'prowlarr indexer schema'
+  profiles=$(api prowlarr GET "http://$base/appprofile" X-Api-Key "$key" application/json </dev/null)
+  expect "$profiles" 2 'prowlarr app profiles read'
+  app_profile=$(body_of "$profiles" | py '
+import json, sys
+profiles = json.load(sys.stdin)
+standard = [p for p in profiles if p.get("name") == "Standard"] or profiles
+print(standard[0]["id"] if standard else "")')
+  [ -n "$app_profile" ] || fail 'prowlarr has no application sync profile to attach indexers to'
+
+  [ -n "${tag_id:-}" ] || fail 'prowlarr_indexers: the tor-proxy tag id is not set'
+  [ -n "${solver_tag_id:-}" ] || fail 'prowlarr_indexers: the solver tag id is not set'
+  names=$(prowlarr_indexer_specs | py 'import json,sys
+for spec in json.load(sys.stdin): print(spec["name"])')
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    want_tags=$(prowlarr_indexer_specs | NAME="$name" TAG="$tag_id" SOLVER="$solver_tag_id" py '
+import json, os, sys
+spec = next(s for s in json.load(sys.stdin) if s["name"] == os.environ["NAME"])
+tags = []
+if spec.get("torProxy"):
+    tags.append(int(os.environ["TAG"]))
+if spec.get("solver"):
+    tags.append(int(os.environ["SOLVER"]))
+print(json.dumps(sorted(tags)))')
+    state=$(body_of "$existing" | NAME="$name" WANT="$want_tags" py '
+import json, os, sys
+found = next((i for i in json.load(sys.stdin) if i.get("name") == os.environ["NAME"]), None)
+if found is None:
+    print("absent")
+elif sorted(found.get("tags") or []) != json.loads(os.environ["WANT"]):
+    print("%d retag" % found["id"])
+else:
+    print("ok")')
+    case $state in
+      ok) printf 'prowlarr indexer %s: unchanged\n' "$name"; continue ;;
+      *' retag')
+        indexer_id=${state%% *}
+        patched=$(body_of "$existing" | ID="$indexer_id" WANT="$want_tags" py '
+import json, os, sys
+entry = next(i for i in json.load(sys.stdin) if i.get("id") == int(os.environ["ID"]))
+entry["tags"] = json.loads(os.environ["WANT"])
+print(json.dumps(entry))')
+        response=$(printf '%s' "$patched" |
+          api prowlarr PUT "http://$base/indexer/$indexer_id?forceSave=true" X-Api-Key "$key" application/json)
+        unset patched
+        expect "$response" 2 "prowlarr indexer $name retag"
+        printf 'prowlarr indexer %s: tags corrected to %s\n' "$name" "$want_tags"
+        continue ;;
+    esac
+    payload=$(body_of "$schema" | NAME="$name" TAG="$tag_id" PROVIDERS="$providers_env" \
+      APP_PROFILE="$app_profile" SOLVER_TAG="$solver_tag_id" SPECS="$(prowlarr_indexer_specs)" py '
+import json, os, sys
+
+def read_env(path):
+    values = {}
+    for line in open(path):
+        line = line.rstrip("\n")
+        if not line or line.startswith("#"):
+            continue
+        name, _, value = line.partition("=")
+        values[name.strip()] = value
+    return values
+
+spec = next(s for s in json.loads(os.environ["SPECS"]) if s["name"] == os.environ["NAME"])
+schema = json.load(sys.stdin)
+if "definitionName" in spec:
+    entry = next((e for e in schema if e.get("definitionName") == spec["definitionName"]), None)
+else:
+    entry = next((e for e in schema if e.get("implementation") == spec["implementation"]), None)
+if entry is None:
+    sys.exit(3)
+
+values = dict(spec.get("fields", {}))
+providers = read_env(os.environ["PROVIDERS"])
+for field, key in spec.get("credentials", {}).items():
+    value = providers.get(key, "")
+    if not value:
+        sys.stderr.write(key)
+        sys.exit(4)
+    values[field] = value
+for field in entry.get("fields", []):
+    if field.get("name") in values:
+        field["value"] = values[field["name"]]
+
+tags = []
+if spec.get("torProxy"):
+    tags.append(int(os.environ["TAG"]))
+if spec.get("solver"):
+    tags.append(int(os.environ["SOLVER_TAG"]))
+entry.update({"name": spec["name"], "enable": True, "priority": spec["priority"],
+              "appProfileId": int(os.environ["APP_PROFILE"]), "tags": tags})
+entry.pop("id", None)
+print(json.dumps(entry))' 2>/tmp/.wire.why) || {
+      case $? in
+        3) printf 'prowlarr indexer %s: skipped (no such definition in this Prowlarr)\n' "$name" ;;
+        4) printf 'prowlarr indexer %s: skipped (%s is empty in %s)\n' \
+             "$name" "$(cat /tmp/.wire.why)" "$providers_env" ;;
+        *) rm -f /tmp/.wire.why; fail "prowlarr indexer $name: could not build the request" ;;
+      esac
+      rm -f /tmp/.wire.why
+      continue
+    }
+    rm -f /tmp/.wire.why
+    response=$(printf '%s' "$payload" |
+      api prowlarr POST "http://$base/indexer?forceSave=true" X-Api-Key "$key" application/json)
+    unset payload
+    case "$(status_of "$response")" in
+      2*) printf 'prowlarr indexer %s: created\n' "$name" ;;
+      *)  why=$(body_of "$response" | py '
+import json, sys
+try:
+    problems = json.load(sys.stdin)
+except Exception:
+    print("unparseable response"); raise SystemExit
+if isinstance(problems, dict):
+    problems = [problems]
+print("; ".join(p.get("errorMessage") or p.get("message") or "" for p in problems)[:200])' || true)
+          printf 'prowlarr indexer %s: NOT created (HTTP %s: %s)\n' \
+            "$name" "$(status_of "$response")" "$why" ;;
+    esac
+  done <<INDEXER_NAMES
+$names
+INDEXER_NAMES
+}
+
+qbt_wiring() {
+  categories=$(api qbittorrent GET http://127.0.0.1:8080/api/v2/torrents/categories '' '' application/json </dev/null)
+  expect "$categories" 2 'qBittorrent categories read'
+  for category in shows movies; do
+    want_path=/staging/downloads/complete/$category
+    state=$(body_of "$categories" | CAT="$category" WANT="$want_path" py '
+import json, os, sys
+categories = json.load(sys.stdin)
+name, want = os.environ["CAT"], os.environ["WANT"]
+if name not in categories:
+    print("absent")
+elif (categories[name].get("savePath") or "").rstrip("/") != want:
+    print("wrong")
+else:
+    print("ok")')
+    case $state in
+      ok) printf 'qBittorrent category %s: unchanged\n' "$category" ;;
+      absent)
+        response=$(printf 'category=%s&savePath=%s' "$category" "$want_path" |
+          api qbittorrent POST http://127.0.0.1:8080/api/v2/torrents/createCategory '' '' application/x-www-form-urlencoded)
+        expect "$response" 2 "qBittorrent category $category"
+        printf 'qBittorrent category %s: created (%s)\n' "$category" "$want_path" ;;
+      wrong)
+        response=$(printf 'category=%s&savePath=%s' "$category" "$want_path" |
+          api qbittorrent POST http://127.0.0.1:8080/api/v2/torrents/editCategory '' '' application/x-www-form-urlencoded)
+        expect "$response" 2 "qBittorrent category $category repoint"
+        printf 'qBittorrent category %s: repointed to %s\n' "$category" "$want_path" ;;
+    esac
+  done
+  response=$(printf 'json={"disk_io_type":3,"web_ui_domain_list":"@@QBITTORRENT_PUBLIC_HOST@@;gluetun","random_port":false,"upnp":false,"reannounce_when_address_changed":true,"save_path":"/staging/downloads/complete","temp_path_enabled":true,"temp_path":"/staging/downloads/incomplete","export_dir":"/staging/torrents","export_dir_fin":"","auto_tmm_enabled":true,"max_seeding_time_enabled":true,"max_seeding_time":20160,"max_ratio_enabled":true,"max_ratio":1.05,"max_ratio_act":0,"max_connec":1000,"max_connec_per_torrent":200,"max_uploads":40,"max_uploads_per_torrent":8,"queueing_enabled":true,"max_active_downloads":6,"max_active_torrents":-1,"max_active_uploads":-1,"merge_trackers":true}' |
+    api qbittorrent POST http://127.0.0.1:8080/api/v2/app/setPreferences '' '' application/x-www-form-urlencoded)
+  expect "$response" 2 'qBittorrent runtime settings'
+  prefs=$(api qbittorrent GET http://127.0.0.1:8080/api/v2/app/preferences '' '' application/json </dev/null)
+  expect "$prefs" 2 'qBittorrent preferences read'
+  body_of "$prefs" | py '
+import json, sys
+p = json.load(sys.stdin)
+want = {"disk_io_type": 3, "random_port": False, "upnp": False, "bypass_local_auth": True,
+        "current_network_interface": "tun0",
+        "reannounce_when_address_changed": True,
+        "save_path": "/staging/downloads/complete", "temp_path_enabled": True,
+        "temp_path": "/staging/downloads/incomplete",
+        "export_dir": "/staging/torrents", "export_dir_fin": "",
+        "auto_tmm_enabled": True,
+        "max_seeding_time_enabled": True, "max_seeding_time": 20160,
+        "max_ratio_enabled": True, "max_ratio": 1.05, "max_ratio_act": 0,
+        "max_connec": 1000, "max_connec_per_torrent": 200,
+        "max_uploads": 40, "max_uploads_per_torrent": 8,
+        "queueing_enabled": True, "max_active_downloads": 6,
+        "max_active_torrents": -1, "max_active_uploads": -1,
+        "merge_trackers": True}
+bad = [(k, p.get(k), v) for k, v in want.items() if p.get(k) != v]
+if "gluetun" not in (p.get("web_ui_domain_list") or ""):
+    bad.append(("web_ui_domain_list", p.get("web_ui_domain_list"), "must contain gluetun"))
+for k, got, exp in bad:
+    print("qBittorrent setting not applied: %s is %r, expected %r" % (k, got, exp), file=sys.stderr)
+sys.exit(1 if bad else 0)' || fail 'qBittorrent runtime settings did not take'
+  runtime_conf=$compose_root/data/qbittorrent/qBittorrent/qBittorrent.conf
+  if grep -Eq '^Session.ShareLimitAction=(RemoveWithContent|Remove|EnableSuperSeeding)$' "$runtime_conf"; then
+    fail "qBittorrent must stop at the share limit, not act on it; Sonarr refuses a client that removes torrents itself"
+  fi
+  printf 'qBittorrent runtime settings: asserted (disk I/O, interface, port policy, host names,\n'
+  printf '  staging save/temp/export paths, share limits 1.05 or 14 days then Stop,\n'
+  printf '  connection and queue limits, tracker merging)\n'
+
+  response=$( py '
+import json, urllib.parse
+password = open("'"$qbt_password_file"'").read().strip()
+print("json=" + urllib.parse.quote(json.dumps({"web_ui_password": password}), safe=""))' |
+    api qbittorrent POST http://127.0.0.1:8080/api/v2/app/setPreferences '' '' application/x-www-form-urlencoded)
+  expect "$response" 2 'qBittorrent password'
+  printf 'qBittorrent Web UI password: asserted from %s\n' "$qbt_password_file"
+}
+
+bazarr_key() { sed -n '/^auth:/,/^[^ ]/{s/^ *apikey: *//p;}' "$compose_root/data/bazarr/config/config.yaml" | tr -d "'\"" | sed -n '1p'; }
+bazarr_wiring() {
+  key=$(bazarr_key); [ -n "$key" ] || fail 'bazarr has no API key yet'
+  ensure_password bazarr
+  payload=$(PASSWORD_FILE="$secrets/bazarr-webui-password" \
+    SONARR_XML="$compose_root/data/sonarr/config.xml" RADARR_XML="$compose_root/data/radarr/config.xml" py '
+import os, re, urllib.parse
+def apikey(path):
+    return re.search(r"<ApiKey>([^<]*)</ApiKey>", open(path).read()).group(1)
+password = open(os.environ["PASSWORD_FILE"]).read().strip()
+sonarr, radarr = apikey(os.environ["SONARR_XML"]), apikey(os.environ["RADARR_XML"])
+fields = {"settings-auth-type": "form", "settings-auth-username": "admin", "settings-auth-password": password,
+          "settings-general-use_sonarr": "true", "settings-sonarr-ip": "sonarr", "settings-sonarr-port": "8989",
+          "settings-sonarr-base_url": "/", "settings-sonarr-ssl": "false", "settings-sonarr-apikey": sonarr,
+          "settings-general-use_radarr": "true", "settings-radarr-ip": "radarr", "settings-radarr-port": "7878",
+          "settings-radarr-base_url": "/", "settings-radarr-ssl": "false", "settings-radarr-apikey": radarr,
+          "settings-analytics-enabled": "false",
+          "settings-sonarr-only_monitored": "true",
+          "settings-radarr-only_monitored": "true",
+          "settings-general-minimum_score": "80",
+          "settings-general-minimum_score_movie": "80"}
+print(urllib.parse.urlencode(fields))')
+  response=$(printf '%s' "$payload" | api bazarr POST http://127.0.0.1:6767/api/system/settings X-API-KEY "$key" application/x-www-form-urlencoded)
+  unset payload
+  expect "$response" 2 'bazarr settings'
+  printf 'bazarr: login, Sonarr/Radarr connections, analytics off, monitored-only, score 80 asserted\n'
+}
+
+bazarr_languages() {
+  key=$(bazarr_key)
+  profiles=$(api bazarr GET http://127.0.0.1:6767/api/system/languages/profiles X-API-KEY "$key" application/json </dev/null)
+  expect "$profiles" 2 'bazarr language profiles read'
+  count=$(body_of "$profiles" | py 'import json,sys; print(len(json.load(sys.stdin)))')
+  if [ "$count" -gt 0 ]; then
+    printf 'bazarr language profiles: unchanged (%s already defined)\n' "$count"
+    return
+  fi
+  payload=$(py '
+import json, urllib.parse
+english = {"id": 1, "language": "en", "forced": "False", "hi": "False",
+           "audio_exclude": "False", "audio_only_include": "False"}
+forced = dict(english, forced="True")
+profiles = [
+    {"profileId": 1, "name": "English", "cutoff": 0, "originalFormat": 0,
+     "items": [english], "mustContain": "", "mustNotContain": "", "tag": ""},
+    {"profileId": 2, "name": "Forced English", "cutoff": 0, "originalFormat": 0,
+     "items": [forced], "mustContain": "", "mustNotContain": "", "tag": ""},
+]
+print(urllib.parse.urlencode([("languages-enabled", "en"),
+                              ("languages-profiles", json.dumps(profiles))]))')
+  response=$(printf '%s' "$payload" | api bazarr POST http://127.0.0.1:6767/api/system/settings \
+    X-API-KEY "$key" application/x-www-form-urlencoded)
+  expect "$response" 2 'bazarr languages'
+  printf 'bazarr languages: created (English enabled; profiles English, Forced English)\n'
+}
+
+bazarr_providers() {
+  key=$(bazarr_key)
+  payload=$(PROVIDERS="$providers_env" py '
+import os, sys, urllib.parse
+
+def read_env(path):
+    values = {}
+    for line in open(path):
+        line = line.rstrip("\n")
+        if not line or line.startswith("#"):
+            continue
+        name, _, value = line.partition("=")
+        values[name.strip()] = value
+    return values
+
+env = read_env(os.environ["PROVIDERS"])
+providers = {
+    "addic7ed": (
+        {"username": "ADDIC7ED_USERNAME", "password": "ADDIC7ED_PASSWORD",
+         "cookies": "ADDIC7ED_COOKIES", "user_agent": "ADDIC7ED_USER_AGENT"},
+        {"vip": "false"},
+    ),
+    "opensubtitlescom": (
+        {"username": "OPENSUBTITLESCOM_USERNAME", "password": "OPENSUBTITLESCOM_PASSWORD"},
+        {"use_hash": "true", "include_ai_translated": "true",
+         "include_machine_translated": "false"},
+    ),
+}
+fields, enabled, skipped = [], [], []
+for name in sorted(providers):
+    credentials, extras = providers[name]
+    missing = [key for key in credentials.values() if not env.get(key)]
+    if missing:
+        skipped.append("%s (%s empty)" % (name, ", ".join(missing)))
+        continue
+    for field, key in credentials.items():
+        fields.append(("settings-%s-%s" % (name, field), env[key]))
+    for field, value in extras.items():
+        fields.append(("settings-%s-%s" % (name, field), value))
+    enabled.append(name)
+for name in enabled:
+    fields.append(("settings-general-enabled_providers", name))
+sys.stderr.write("enabled=%s\nskipped=%s\n" % (",".join(enabled) or "-", "; ".join(skipped) or "-"))
+if not enabled:
+    sys.exit(3)
+print(urllib.parse.urlencode(fields))' 2>/tmp/.wire.why) || {
+    printf 'bazarr providers: none configured (%s)\n' \
+      "$(sed -n 's/^skipped=//p' /tmp/.wire.why)" >&2
+    rm -f /tmp/.wire.why
+    return 0
+  }
+  enabled=$(sed -n 's/^enabled=//p' /tmp/.wire.why)
+  skipped=$(sed -n 's/^skipped=//p' /tmp/.wire.why)
+  rm -f /tmp/.wire.why
+  response=$(printf '%s' "$payload" | api bazarr POST http://127.0.0.1:6767/api/system/settings \
+    X-API-KEY "$key" application/x-www-form-urlencoded)
+  unset payload
+  expect "$response" 2 'bazarr providers'
+  printf 'bazarr providers: asserted (%s)\n' "$enabled"
+  [ "$skipped" = '-' ] || printf 'bazarr providers skipped: %s\n' "$skipped"
+}
+
+arr_jellyfin_notification() {
+  app=$1; base=$2; key=$(arr_key "$app")
+  existing=$(api "$app" GET "http://$base/notification" X-Api-Key "$key" application/json </dev/null)
+  expect "$existing" 2 "$app notifications read"
+  if body_of "$existing" | py '
+import json, sys
+sys.exit(0 if any(n.get("implementation") == "MediaBrowser" for n in json.load(sys.stdin)) else 1)'; then
+    printf '%s Jellyfin notification: unchanged\n' "$app"
+    return 0
+  fi
+  schema=$(api "$app" GET "http://$base/notification/schema" X-Api-Key "$key" application/json </dev/null)
+  expect "$schema" 2 "$app notification schema"
+  payload=$(body_of "$schema" | KEY_FILE="$jellyfin_key_file" py '
+import json, os, sys
+entry = next(e for e in json.load(sys.stdin) if e.get("implementation") == "MediaBrowser")
+values = {"host": "@@JELLYFIN_BACKEND_HOST@@", "port": 30013, "useSsl": False,
+          "urlBase": "", "apiKey": open(os.environ["KEY_FILE"]).read().strip(),
+          "notify": False, "updateLibrary": True}
+for field in entry.get("fields", []):
+    if field.get("name") in values:
+        field["value"] = values[field["name"]]
+quiet = {"onGrab", "onHealthIssue", "onHealthRestored", "onApplicationUpdate",
+         "onManualInteractionRequired", "onSeriesAdd", "onMovieAdded"}
+for supports in [k for k in entry if k.startswith("supportsOn")]:
+    trigger = "on" + supports[len("supportsOn"):]
+    if entry.get(supports):
+        entry[trigger] = trigger not in quiet
+entry.update({"name": "Jellyfin", "tags": []})
+entry.pop("id", None)
+print(json.dumps(entry))')
+  response=$(printf '%s' "$payload" | api "$app" POST "http://$base/notification" X-Api-Key "$key" application/json)
+  unset payload
+  case "$(status_of "$response")" in
+    2*) printf '%s Jellyfin notification: created (@@JELLYFIN_BACKEND_HOST@@:30013, library refresh)\n' "$app" ;;
+    *)  why=$(body_of "$response" | py '
+import json, sys
+try:
+    problems = json.load(sys.stdin)
+except Exception:
+    print("unparseable response"); raise SystemExit
+if isinstance(problems, dict):
+    problems = [problems]
+print("; ".join(p.get("errorMessage") or p.get("message") or "" for p in problems)[:200])' || true)
+        printf '%s Jellyfin notification: NOT created (HTTP %s: %s)\n' \
+          "$app" "$(status_of "$response")" "$why" ;;
+  esac
+}
+
+write_integrations_env() {
+  tmp=$(mktemp "$secrets/.torrent-integrations.XXXXXX")
+  ( umask 077
+    printf 'SONARR_API_KEY=%s\n' "$(arr_key sonarr)"
+    printf 'RADARR_API_KEY=%s\n' "$(arr_key radarr)"
+    printf 'PROWLARR_API_KEY=%s\n' "$(arr_key prowlarr)"
+    printf 'BAZARR_API_KEY=%s\n' "$(bazarr_key)"
+    printf 'UN_SONARR_0_API_KEY=%s\n' "$(arr_key sonarr)"
+    printf 'UN_RADARR_0_API_KEY=%s\n' "$(arr_key radarr)"
+  ) > "$tmp"
+  chown root:root "$tmp"; chmod 0600 "$tmp"
+  if [ -f "$integrations_env" ] && cmp -s "$tmp" "$integrations_env"; then
+    rm -f "$tmp"; printf 'integrations secret: unchanged\n'
+  else
+    mv "$tmp" "$integrations_env"; printf 'integrations secret: written (%s)\n' "$integrations_env"
+  fi
+  chown root:torrent-services "$qbt_password_file"; chmod 0640 "$qbt_password_file"
+}
+
+wait_healthy() {
+  for container in "$@"; do
+    tries=0
+    until [ "$(docker inspect -f '{{.State.Health.Status}}' "$container" 2>/dev/null || echo absent)" = healthy ]; do
+      tries=$((tries + 1)); [ "$tries" -le 60 ] || fail "$container did not become healthy"
+      sleep 5
+    done
+    printf '%s: healthy\n' "$container"
+  done
+}
+
+if [ "${1:-}" = --profiles-only ]; then
+  step 'Sonarr and Radarr: custom formats and resolution profiles'
+  arr_media_profiles sonarr 127.0.0.1:8989/api/v3
+  arr_media_profiles radarr 127.0.0.1:7878/api/v3
+  exit 0
+fi
+
+step 'Sonarr, Radarr, Prowlarr: Forms authentication'
+arr_forms_auth sonarr 127.0.0.1:8989/api/v3
+arr_forms_auth radarr 127.0.0.1:7878/api/v3
+arr_forms_auth prowlarr 127.0.0.1:9696/api/v1
+
+step 'qBittorrent: categories and password'
+qbt_wiring
+
+step 'Sonarr and Radarr: file naming'
+arr_naming sonarr 127.0.0.1:8989/api/v3 <<'SONARR_NAMING'
+{"renameEpisodes": true,
+ "standardEpisodeFormat": "{Series Title} ({Series Year}) - S{season:00}E{episode:00} - {Episode Title}",
+ "dailyEpisodeFormat": "{Series Title} - {Air-Date} - {Episode Title}",
+ "animeEpisodeFormat": "{Series Title} - S{season:00}E{episode:00} - {Episode Title}",
+ "seriesFolderFormat": "{Series Title} ({Series Year})",
+ "seasonFolderFormat": "Season {season}",
+ "specialsFolderFormat": "Extras",
+ "multiEpisodeStyle": 5,
+ "replaceIllegalCharacters": true}
+SONARR_NAMING
+arr_naming radarr 127.0.0.1:7878/api/v3 <<'RADARR_NAMING'
+{"renameMovies": true,
+ "standardMovieFormat": "{Movie Title} ({Release Year}){ [Edition:ifexists]}{ [Quality Title]}{ [MediaInfo VideoDynamicRange:ifexists]}{ [MediaInfo AudioCodec}{ MediaInfo AudioChannels]}",
+ "movieFolderFormat": "{Movie Title} ({Release Year})",
+ "replaceIllegalCharacters": true}
+RADARR_NAMING
+
+step 'Sonarr and Radarr: download client and root folders'
+arr_download_client sonarr 127.0.0.1:8989/api/v3 tvCategory shows
+arr_root_folders sonarr 127.0.0.1:8989/api/v3 /data/shows /data/family-shows
+arr_download_client radarr 127.0.0.1:7878/api/v3 movieCategory movies
+arr_root_folders radarr 127.0.0.1:7878/api/v3 /data/movies /data/family-movies
+
+step 'Sonarr and Radarr: custom formats and resolution profiles'
+arr_media_profiles sonarr 127.0.0.1:8989/api/v3
+arr_media_profiles radarr 127.0.0.1:7878/api/v3
+
+step 'Prowlarr: applications, tor-proxy tag, Torarr proxy'
+prowlarr_wiring
+
+step 'Prowlarr: indexers'
+prowlarr_indexers
+
+step 'Bazarr: login and connections'
+bazarr_wiring
+
+step 'Sonarr and Radarr: Jellyfin library refresh'
+if [ ! -s "$jellyfin_key_file" ]; then
+  printf 'Jellyfin notification: skipped (no key in %s)\n' "$jellyfin_key_file"
+elif [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 \
+    -H "Authorization: MediaBrowser Client=\"@@WIRING_CLIENT@@\", Device=\"torrent-services\", DeviceId=\"@@WIRING_DEVICE_ID@@\", Version=\"1\", Token=\"$(cat "$jellyfin_key_file")\"" \
+    http://@@JELLYFIN_BACKEND_HOST@@:30013/System/Info)" = 200 ]; then
+  arr_jellyfin_notification sonarr 127.0.0.1:8989/api/v3
+  arr_jellyfin_notification radarr 127.0.0.1:7878/api/v3
+else
+  printf 'Jellyfin notification: skipped, Jellyfin refused the key in %s\n' "$jellyfin_key_file" >&2
+  printf '  generate one in Jellyfin: Dashboard, Advanced, API Keys, then re-run\n' >&2
+fi
+
+step 'Bazarr: languages and subtitle providers'
+bazarr_languages
+bazarr_providers
+
+step 'Integrations secret and profile'
+write_integrations_env
+compose --profile torrent-ready --profile torrent-integrations up -d unpackerr scraparr qbittorrent-exporter
+wait_healthy unpackerr scraparr qbittorrent-exporter
+
+step 'Proof'
+prowlarr_api_key=$(arr_key prowlarr)
+indexer_list=$(body_of "$(api prowlarr GET http://127.0.0.1:9696/api/v1/indexer \
+  X-Api-Key "$prowlarr_api_key" application/json </dev/null)")
+tests=$(api prowlarr POST http://127.0.0.1:9696/api/v1/indexer/testall \
+  X-Api-Key "$prowlarr_api_key" application/json </dev/null)
+if [ "$(status_of "$tests")" = 200 ] || [ "$(status_of "$tests")" = 201 ]; then
+  body_of "$tests" | INDEXERS="$indexer_list" py '
+import json, os, sys
+names = {i["id"]: i["name"] for i in json.loads(os.environ["INDEXERS"])}
+for result in json.load(sys.stdin):
+    name = names.get(result.get("id"), "id %s" % result.get("id"))
+    if result.get("isValid"):
+        print("indexer %s: ok" % name)
+    else:
+        why = "; ".join(f.get("errorMessage") or "" for f in result.get("validationFailures", []))
+        print("indexer %s: FAILED (%s)" % (name, why or "no reason given"))'
+else
+  printf 'indexer tests: HTTP %s (skipped)\n' "$(status_of "$tests")" >&2
+fi
+bazarr_settings=$(body_of "$(api bazarr GET http://127.0.0.1:6767/api/system/settings \
+  X-API-KEY "$(bazarr_key)" application/json </dev/null)")
+printf '%s' "$bazarr_settings" | py '
+import json, sys
+settings = json.load(sys.stdin)
+print("bazarr enabled providers: %s" % (",".join(settings["general"]["enabled_providers"]) or "none"))'
+unset bazarr_settings indexer_list prowlarr_api_key
+n=$(docker exec qbittorrent-exporter /usr/bin/wget -qO- http://127.0.0.1:8090/metrics | grep -c '^qbittorrent_' || true)
+[ "$n" -gt 0 ] && printf 'qbittorrent-exporter: %s qbittorrent_* metrics\n' "$n" ||
+  printf 'qbittorrent-exporter: no qbittorrent_* metrics yet (check its log for a login failure)\n' >&2
+m=$(docker exec scraparr /usr/bin/wget -qO- http://127.0.0.1:7100/metrics | grep -c -E '^(sonarr|radarr|prowlarr|bazarr)_' || true)
+[ "$m" -gt 0 ] && printf 'scraparr: %s *arr metrics\n' "$m" ||
+  printf 'scraparr: no *arr metrics yet (check its log)\n' >&2
+docker logs unpackerr 2>&1 | grep -i -E 'sonarr|radarr' | tail -2 | sed 's/^/unpackerr: /'
+if [ "$torarr_state" = healthy ]; then
+  printf 'torarr /ready: HTTP %s\n' "$(docker exec torarr /usr/bin/wget -q -O /dev/null -S http://127.0.0.1:9091/ready 2>&1 | sed -n 's/.*HTTP\/[0-9.]* \([0-9]*\).*/\1/p' | tail -1)"
+else
+  printf 'torarr: %s (re-run once it is healthy to add the Prowlarr proxy)\n' "$torarr_state"
+fi
+printf '\nwire-torrent-apps: done. Re-run at any time; it changes nothing that already exists.\n'

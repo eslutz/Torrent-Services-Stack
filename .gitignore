@@ -276,3 +276,11 @@ media/
 logs/
 torrent_backup/
 venv/
+
+# Preserved local experiment; not an active deployment or publication input.
+/v2/
+/rendered/
+__pycache__/
+/settings.local.json
+
+/Torrent-Services-v2/

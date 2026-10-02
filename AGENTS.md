@@ -1,0 +1,3 @@
+# Operating instructions
+
+This is a public reusable project. Never import private Git history, household settings, tracker identities, personal media evidence or credential catalogs. Template parameters and native runtime secret files are its boundary. settings.example.json must remain generic. Preserve VPN isolation, forwarded-port hooks, mounts, image digest pins, authenticated applications and ingress restrictions. Legacy material and local v2 experiments are not active entrypoints. Run ./scripts/verify. No verification command may deploy or enable conversion. Preserve attribution and existing public history.

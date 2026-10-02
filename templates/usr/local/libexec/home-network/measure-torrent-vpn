@@ -1,0 +1,185 @@
+#!/bin/sh
+set -eu
+
+
+url=${MEASURE_URL:-http://speedtest.newark.linode.com/100MB-newark.bin}
+samples=${MEASURE_SAMPLES:-12}
+interval=${MEASURE_INTERVAL:-10}
+run_torrent=no
+use_tmpfs=no
+list_servers=no
+compose_root=@@APP_ROOT@@/torrent-services
+image_lock=@@CONFIG_ROOT@@/image-locks/torrent-services.env
+
+usage() {
+  printf 'usage: measure-torrent-vpn [--torrent [--tmpfs]] [--servers] [--samples N] [--interval SECONDS] [--url URL]\n' >&2
+  exit 64
+}
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --torrent) run_torrent=yes ;;
+    --tmpfs) use_tmpfs=yes ;;
+    --servers) list_servers=yes ;;
+    --samples) samples=$2; shift ;;
+    --interval) interval=$2; shift ;;
+    --url) url=$2; shift ;;
+    *) usage ;;
+  esac
+  shift
+done
+
+[ "$(id -u)" -eq 0 ] || { printf 'run as root (sudo)\n' >&2; exit 64; }
+case "$samples" in ''|*[!0-9]*|0) printf 'samples must be a positive integer\n' >&2; usage ;; esac
+case "$interval" in ''|*[!0-9]*|0) printf 'interval must be a positive integer\n' >&2; usage ;; esac
+
+mbps() {
+  awk -v b="$1" 'BEGIN { printf "%.1f", b * 8 / 1000000 }'
+}
+
+section() { printf '\n== %s\n' "$1"; }
+
+if [ "$list_servers" = yes ]; then
+  section 'Proton port-forwarding WireGuard servers in the pinned Gluetun image'
+  image=$(sed -n 's/^GLUETUN_IMAGE=//p' "$image_lock")
+  [ -n "$image" ] || { printf 'GLUETUN_IMAGE missing from %s\n' "$image_lock" >&2; exit 69; }
+  list=$(docker run --rm "$image" format-servers -protonvpn 2>/dev/null |
+    awk -F'|' 'tolower($2) ~ /united states/ && $6 ~ /wireguard/ && $8 ~ /✅/ { print }' | sort)
+  [ -n "$list" ] || { printf 'no @@VPN_COUNTRY@@ WireGuard port-forwarding servers found; the image list or its format changed\n' >&2; exit 69; }
+  printf '%s\n' "$list"
+  printf '\ncities: '; printf '%s\n' "$list" | awk -F'|' '{ gsub(/^ +| +$/, "", $4); print $4 }' | sort | uniq -c | sort -rn | sed -E 's/^ *([0-9]+) (.*)$/\2(\1)/' | tr '\n' ' '; printf '\n'
+  exit 0
+fi
+
+section 'containers'
+docker ps --filter name=gluetun --filter name=qbittorrent \
+  --format 'table {{.Names}}\t{{.Status}}'
+docker inspect -f '{{.State.Running}}' gluetun >/dev/null 2>&1 ||
+  { printf 'gluetun is not running\n' >&2; exit 69; }
+gluetun_pid=$(docker inspect -f '{{.State.Pid}}' gluetun)
+
+section "1. host path, no tunnel ($url)"
+host_bps=$(curl -s -o /dev/null -w '%{speed_download}' --max-time 60 "$url" || echo 0)
+printf 'host download: %s Mbit/s\n' "$(mbps "$host_bps")"
+
+section '2. same download inside the tunnel'
+tunnel_bps=$(docker exec qbittorrent curl -s -o /dev/null -w '%{speed_download}' --max-time 90 "$url" || echo 0)
+printf 'tunnel download: %s Mbit/s\n' "$(mbps "$tunnel_bps")"
+
+section '3. identity'
+host_ip=$(curl -sf --max-time 10 https://api.ipify.org) || host_ip=unknown
+tunnel_ip=$(docker exec qbittorrent curl -sf --max-time 20 https://api.ipify.org) || tunnel_ip=unknown
+printf 'host public IP:   %s\n' "$host_ip"
+printf 'tunnel public IP: %s\n' "$tunnel_ip"
+if [ "$host_ip" = unknown ] || [ "$tunnel_ip" = unknown ]; then
+  printf 'identity: UNAVAILABLE (a public-IP lookup failed; nothing proven either way)\n' >&2
+elif [ "$host_ip" = "$tunnel_ip" ]; then
+  printf 'LEAK: the tunnel exits with the host address\n' >&2
+else
+  printf 'identity: OK (tunnel and host addresses differ)\n'
+fi
+printf 'gluetun status:   %s\n' "$(docker exec gluetun wget -qO- http://127.0.0.1:8000/v1/vpn/status 2>/dev/null || echo unavailable)"
+printf 'gluetun public IP:%s\n' "$(docker exec gluetun wget -qO- http://127.0.0.1:8000/v1/publicip/ip 2>/dev/null || echo ' unavailable')"
+forwarded=$(docker exec gluetun wget -qO- http://127.0.0.1:8000/v1/portforward 2>/dev/null || echo '')
+printf 'forwarded port:   %s\n' "${forwarded:-unavailable}"
+link=$(nsenter -t "$gluetun_pid" -n ip -d link show tun0 2>/dev/null || true)
+if printf '%s' "$link" | grep -q ' wireguard '; then
+  printf 'tun0 implementation: kernelspace WireGuard\n'
+elif printf '%s' "$link" | grep -q ' tun '; then
+  printf 'tun0 implementation: userspace (tun device) -- expected kernelspace\n'
+else
+  printf 'tun0: absent\n'
+fi
+printf 'tun0 mtu:         %s\n' "$(printf '%s' "$link" | sed -n 's/.* mtu \([0-9]*\).*/\1/p' | head -1)"
+printf 'server / MTU / implementation lines from the Gluetun log:\n'
+docker logs gluetun 2>&1 | grep -E 'Connecting to|Wireguard setup|implementation|mtu|MTU|forwarded port|Public IP' | tail -8 | sed 's/^/  /'
+
+section '4. qBittorrent'
+prefs=$(docker exec qbittorrent curl -s --max-time 10 http://127.0.0.1:8080/api/v2/app/preferences || echo '{}')
+info=$(docker exec qbittorrent curl -s --max-time 10 http://127.0.0.1:8080/api/v2/transfer/info || echo '{}')
+printf '%s\n%s\n' "$prefs" "$info" | python3 -c '
+import json, sys
+lines = sys.stdin.read().splitlines()
+try:
+    p = json.loads(lines[0]); i = json.loads(lines[1])
+except Exception as e:
+    print("qBittorrent API unavailable:", e); sys.exit(0)
+print("listen_port:      ", p.get("listen_port"))
+print("interface:        ", p.get("current_network_interface") or "(any)")
+d = p.get("disk_io_type")
+print("disk_io_type:     ", d, "OK (3 = simple pread/pwrite)" if d == 3 else "MISMATCH (expected 3 = simple pread/pwrite; 2 = POSIX-compliant loses file priorities across restarts)")
+print("bypass_local_auth:", p.get("bypass_local_auth"))
+print("save_path:        ", p.get("save_path"))
+print("connection_status:", i.get("connection_status"), "(connected = the forwarded port reaches qBittorrent)")
+print("dht_nodes:        ", i.get("dht_nodes"))
+'
+if [ -n "$forwarded" ]; then
+  port=$(printf '%s' "$forwarded" | sed -n 's/.*"port":\([0-9]*\).*/\1/p')
+  listen=$(printf '%s' "$prefs" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("listen_port"))' 2>/dev/null || echo '?')
+  if [ -n "$port" ] && [ "$port" = "$listen" ]; then
+    printf 'port sync: OK (qBittorrent listens on the forwarded port %s)\n' "$port"
+  else
+    printf 'port sync: MISMATCH (forwarded %s, qBittorrent %s)\n' "${port:-?}" "$listen" >&2
+  fi
+fi
+
+if [ "$run_torrent" = yes ]; then
+  save_path=/staging/downloads/incomplete/measure
+  [ "$use_tmpfs" = yes ] && save_path=/measure
+  section "5. real torrent: Debian netinst to $save_path, $samples samples every ${interval}s"
+  listing=https://cdimage.debian.org/debian-cd/current/amd64/bt-cd/
+  name=$(curl -s --max-time 30 "$listing" | grep -o 'debian-[0-9.]*-amd64-netinst.iso.torrent' | head -1)
+  [ -n "$name" ] || { printf 'could not find the current netinst torrent at %s\n' "$listing" >&2; exit 69; }
+  torrent_url="$listing$name"
+  cleanup_measure() {
+    h=$(docker exec qbittorrent curl -s --max-time 10 'http://127.0.0.1:8080/api/v2/torrents/info?category=measure' 2>/dev/null |
+      python3 -c 'import json,sys
+try:
+    t = json.load(sys.stdin); print(t[0]["hash"] if t else "")
+except Exception:
+    print("")' 2>/dev/null || true)
+    if [ -n "$h" ]; then
+      docker exec qbittorrent curl -s -o /dev/null --max-time 10 --data "hashes=$h&deleteFiles=true" \
+        http://127.0.0.1:8080/api/v2/torrents/delete 2>/dev/null || true
+      printf 'removed the measurement torrent and its data\n'
+    fi
+  }
+  trap cleanup_measure EXIT INT TERM
+  printf 'adding %s\n' "$torrent_url"
+  docker exec qbittorrent curl -s -o /dev/null --max-time 30 \
+    -F "urls=$torrent_url" -F 'category=measure' -F "savepath=$save_path" \
+    -F 'useDownloadPath=false' -F 'sequentialDownload=false' http://127.0.0.1:8080/api/v2/torrents/add
+  sleep "$interval"
+  printf 'pieces are landing in: %s\n' "$(docker exec qbittorrent curl -s --max-time 10 'http://127.0.0.1:8080/api/v2/torrents/info?category=measure' |
+    python3 -c 'import json,sys
+try:
+    t = json.load(sys.stdin); print(t[0].get("content_path") or t[0].get("save_path") if t else "(torrent not yet listed)")
+except Exception:
+    print("(unavailable)")' 2>/dev/null || echo '(unavailable)')"
+  n=0; peak=0; total=0
+  while [ "$n" -lt "$samples" ]; do
+    sleep "$interval"
+    n=$((n + 1))
+    row=$(docker exec qbittorrent curl -s --max-time 10 'http://127.0.0.1:8080/api/v2/torrents/info?category=measure' 2>/dev/null |
+      python3 -c '
+import json, sys
+try:
+    t = json.load(sys.stdin)
+except Exception:
+    print("0 0 0 0 unavailable"); sys.exit()
+if not t: print("0 0 0 0 pending"); sys.exit()
+t = t[0]
+print(int(t.get("dlspeed", 0) or 0), t.get("num_seeds", 0), t.get("num_leechs", 0), round(100 * float(t.get("progress", 0) or 0), 1), t.get("state"))
+' 2>/dev/null || echo '0 0 0 0 unavailable')
+    set -- $row
+    printf 'sample %2d: %7s Mbit/s  seeds=%s peers=%s progress=%s%% state=%s\n' "$n" "$(mbps "$1")" "$2" "$3" "$4" "$5"
+    total=$((total + $1))
+    [ "$1" -gt "$peak" ] && peak=$1
+  done
+  printf 'peak %s Mbit/s, mean %s Mbit/s over %s samples\n' "$(mbps "$peak")" "$(mbps $((total / samples)))" "$samples"
+  cleanup_measure
+  trap - EXIT INT TERM
+fi
+
+section 'summary'
+printf 'host %s Mbit/s -> tunnel %s Mbit/s\n' "$(mbps "$host_bps")" "$(mbps "$tunnel_bps")"
+printf 'If the tunnel is far below the host, consult the fallback ladder in docs/operations/TORRENT_STACK.md.\n'

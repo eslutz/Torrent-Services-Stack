@@ -1,0 +1,436 @@
+#!/usr/bin/python3
+"""Plan and verify resolution quality profiles and the custom formats they
+score, for wire-torrent-apps and assign-media-profiles.
+
+Pure: it reads the JSON files named on its command line, prints JSON, and
+never touches the network or sees an API key. The callers fetch and send.
+
+  arr-profiles plan-formats   --declared F --live F --schema F
+  arr-profiles verify-formats --declared F --live F --schema F
+  arr-profiles plan-profile   --app A --specs F --formats F --profiles F --schema F
+  arr-profiles verify-profile --app A --specs F --formats F --profiles F --schema F
+  arr-profiles assignments    --app A --profiles F --items F
+  arr-profiles move-plan      --app A --profiles F --items F --from NAME --to NAME [--limit N]
+  arr-profiles restore-plan   --app A --items F --saved F
+
+The plan commands print one JSON object per line: {"change", "name",
+"method", "path", "body"}, where change is create, update or unchanged and an
+unchanged line has no method. The verify commands print nothing and exit 0
+when the live state matches the declaration, and name each difference and
+exit 1 when it does not. A declaration that cannot be applied exits 65.
+
+Guarantees the callers rely on: no plan ever targets the profile named Any,
+which import-media-library selects by name; no plan ever deletes; and a
+profile always lists every quality and every live custom format, which both
+applications require.
+"""
+import argparse
+import json
+import sys
+
+APPS = ('sonarr', 'radarr')
+PROTECTED_PROFILE = 'Any'
+GROUP_ID_BASE = 1001
+BLOCKED_AT = -10000
+EDITOR = {'sonarr': ('/series/editor', 'seriesIds'), 'radarr': ('/movie/editor', 'movieIds')}
+
+
+class PlanError(Exception):
+    """The declaration cannot be applied as written."""
+
+
+def load(path):
+    with open(path, encoding='utf-8') as handle:
+        return json.load(handle)
+
+
+
+def declared_formats(document):
+    formats = document['formats'] if isinstance(document, dict) else document
+    names = [entry['name'] for entry in formats]
+    repeated = sorted({name for name in names if names.count(name) > 1})
+    if repeated:
+        raise PlanError('declared custom format names repeat: ' + ', '.join(repeated))
+    return formats
+
+
+def schema_fields(schema):
+    """Condition implementation -> the field names the application accepts."""
+    return {entry['implementation']: {field['name'] for field in entry.get('fields') or []}
+            for entry in schema}
+
+
+def field_values(fields):
+    """Both shapes to one: TRaSH writes {name: value}, the API [{name, value}]."""
+    if isinstance(fields, dict):
+        return dict(fields)
+    return {field['name']: field.get('value') for field in fields or []}
+
+
+def format_body(declared, known):
+    specifications = []
+    for spec in declared['specifications']:
+        implementation = spec['implementation']
+        if implementation not in known:
+            raise PlanError('%s: this application has no %s condition'
+                            % (declared['name'], implementation))
+        values = field_values(spec.get('fields'))
+        unknown = sorted(set(values) - known[implementation])
+        if unknown:
+            raise PlanError('%s: %s has no field %s'
+                            % (declared['name'], implementation, ', '.join(unknown)))
+        specifications.append({
+            'name': spec['name'],
+            'implementation': implementation,
+            'negate': bool(spec.get('negate', False)),
+            'required': bool(spec.get('required', False)),
+            'fields': [{'name': name, 'value': values[name]} for name in sorted(values)],
+        })
+    return {'name': declared['name'],
+            'includeCustomFormatWhenRenaming': bool(declared.get('includeCustomFormatWhenRenaming', False)),
+            'specifications': specifications}
+
+
+def condition_keys(specifications, declared_fields):
+    """Order-free comparison keys. Only declared fields count: the application
+    fills every other field with its default and returns it."""
+    keys = []
+    for spec in specifications:
+        names = declared_fields.get(spec.get('implementation'), set())
+        values = field_values(spec.get('fields'))
+        keys.append(json.dumps([spec.get('name'), spec.get('implementation'),
+                                bool(spec.get('negate')), bool(spec.get('required')),
+                                sorted((name, values.get(name)) for name in names)],
+                               sort_keys=True))
+    return sorted(keys)
+
+
+def format_matches(body, live):
+    declared_fields = {}
+    for spec in body['specifications']:
+        declared_fields.setdefault(spec['implementation'], set()).update(
+            field['name'] for field in spec['fields'])
+    return (body['includeCustomFormatWhenRenaming'] == bool(live.get('includeCustomFormatWhenRenaming'))
+            and condition_keys(body['specifications'], declared_fields)
+            == condition_keys(live.get('specifications') or [], declared_fields))
+
+
+def plan_formats(declared, live, schema):
+    known = schema_fields(schema)
+    by_name = {entry['name']: entry for entry in live}
+    actions = []
+    for entry in declared_formats(declared):
+        body = format_body(entry, known)
+        current = by_name.get(entry['name'])
+        if current is None:
+            actions.append({'change': 'create', 'name': entry['name'], 'method': 'POST',
+                            'path': '/customformat', 'body': body})
+        elif format_matches(body, current):
+            actions.append({'change': 'unchanged', 'name': entry['name']})
+        else:
+            body['id'] = current['id']
+            actions.append({'change': 'update', 'name': entry['name'], 'method': 'PUT',
+                            'path': '/customformat/%d' % current['id'], 'body': body})
+    return actions
+
+
+
+def expand_profile_specs(document):
+    """Share preference scores while giving each profile a resolution ceiling."""
+    if document.get('schema') != 1:
+        return document
+    result = {}
+    for app in APPS:
+        result[app] = []
+        for entry in document['profiles']:
+            groups = [group for group in document['qualities'][app]
+                      if group['resolution'] <= entry['maxResolution']]
+            if not groups:
+                raise PlanError('no allowed qualities for %s' % entry['name'])
+            spec = {key: document[key] for key in
+                    ('upgradeAllowed', 'minFormatScore', 'cutoffFormatScore', 'minUpgradeFormatScore')}
+            spec.update({'name': entry['name'], 'cutoff': groups[0]['group'],
+                         'qualities': [{'group': group['group'], 'qualities': group['qualities']}
+                                       for group in groups],
+                         'scores': dict(document['scores'], **document.get('appScores', {}).get(app, {}))})
+            if entry.get('renameFrom'):
+                spec['renameFrom'] = entry['renameFrom']
+            result[app].append(spec)
+    return result
+
+def spec_for(specs, app):
+    if app not in APPS:
+        raise PlanError('unknown application: %s' % app)
+    if app not in specs:
+        raise PlanError('no profile is declared for %s' % app)
+    spec = specs[app]
+    if spec['name'] == PROTECTED_PROFILE:
+        raise PlanError('refusing to write the %s profile; import-media-library selects it by name'
+                        % PROTECTED_PROFILE)
+    validate_scores(spec)
+    return spec
+
+
+def validate_scores(spec):
+    """The score arithmetic that makes the table mean what it says."""
+    scores = spec['scores']
+    minimum = spec['minFormatScore']
+    if spec['minUpgradeFormatScore'] < 1:
+        raise PlanError('minUpgradeFormatScore must be at least 1, or every rescore is an upgrade')
+    best = sum(score for score in scores.values() if score > 0)
+    for name, score in sorted(scores.items()):
+        if score <= BLOCKED_AT and score + best >= minimum:
+            raise PlanError('%s is meant to block, but %d plus the best positive total %d reaches '
+                            'the minimum %d' % (name, score, best, minimum))
+        if BLOCKED_AT < score < 0 and score < minimum:
+            raise PlanError('%s is meant to score down, not block, but %d is below the minimum %d'
+                            % (name, score, minimum))
+    if spec['cutoffFormatScore'] > best:
+        raise PlanError('cutoffFormatScore %d can never be reached; the best total is %d'
+                        % (spec['cutoffFormatScore'], best))
+
+
+def schema_qualities(schema_profile):
+    """Every quality the application knows, by name, in its ascending order.
+    The schema can already hold groups (Radarr's WEB groups), so it is walked."""
+    qualities, order = {}, []
+
+    def walk(items):
+        for item in items:
+            if item.get('quality'):
+                quality = item['quality']
+                qualities[quality['name']] = quality
+                order.append(quality['name'])
+            else:
+                walk(item.get('items') or [])
+    walk(schema_profile['items'])
+    return qualities, order
+
+
+def desired_items(spec, schema_profile, app):
+    """The spec lists qualities most preferred first, as the interface shows
+    them. The API wants the reverse, least preferred first. Every quality the
+    spec does not list is added below them, not allowed, because a profile
+    must hold every quality."""
+    qualities, order = schema_qualities(schema_profile)
+    listed, seen, ids = [], set(), {}
+    next_id = GROUP_ID_BASE
+    for entry in spec['qualities']:
+        group = None if isinstance(entry, str) else entry['group']
+        names = [entry] if isinstance(entry, str) else entry['qualities']
+        for name in names:
+            if name not in qualities:
+                raise PlanError('%s has no quality named %s' % (app, name))
+            if name in seen:
+                raise PlanError('%s is listed twice' % name)
+            seen.add(name)
+        if group is None:
+            listed.append({'quality': qualities[names[0]], 'items': [], 'allowed': True})
+            ids[names[0]] = qualities[names[0]]['id']
+            continue
+        if len(names) < 2:
+            raise PlanError('group %s needs at least two qualities' % group)
+        if group in qualities or group in ids:
+            raise PlanError('group name %s is already a quality or group' % group)
+        listed.append({'id': next_id, 'name': group, 'allowed': True,
+                       'items': [{'quality': qualities[name], 'items': [], 'allowed': True}
+                                 for name in names]})
+        ids[group] = next_id
+        next_id += 1
+    rest = [{'quality': qualities[name], 'items': [], 'allowed': False}
+            for name in order if name not in seen]
+    if spec['cutoff'] not in ids:
+        raise PlanError('cutoff %s is not an allowed quality or group' % spec['cutoff'])
+    return rest + list(reversed(listed)), ids[spec['cutoff']]
+
+
+def profile_body(spec, formats, profiles, schema_profile, app):
+    items, cutoff = desired_items(spec, schema_profile, app)
+    live_names = {entry['name'] for entry in formats}
+    missing = sorted(set(spec['scores']) - live_names)
+    if missing:
+        raise PlanError('scored custom formats do not exist in %s: %s' % (app, ', '.join(missing)))
+    body = {'name': spec['name'], 'upgradeAllowed': bool(spec['upgradeAllowed']),
+            'cutoff': cutoff, 'items': items,
+            'minFormatScore': spec['minFormatScore'],
+            'cutoffFormatScore': spec['cutoffFormatScore'],
+            'minUpgradeFormatScore': spec['minUpgradeFormatScore'],
+            'formatItems': [{'format': entry['id'], 'name': entry['name'],
+                             'score': spec['scores'].get(entry['name'], 0)}
+                            for entry in sorted(formats, key=lambda f: f['id'])]}
+    if 'language' in schema_profile:
+        protected = next((p for p in profiles if p.get('name') == PROTECTED_PROFILE), None)
+        body['language'] = (protected or schema_profile)['language']
+    return body
+
+
+def profile_shape(profile, formats):
+    """Everything that decides behaviour, by name, so group ids do not count."""
+    names = {entry['id']: entry['name'] for entry in formats}
+    by_id = {}
+
+    def item(entry):
+        if entry.get('quality'):
+            by_id.setdefault(entry['quality']['id'], entry['quality']['name'])
+            return ['quality', entry['quality']['name'], bool(entry.get('allowed'))]
+        for member in entry.get('items') or []:
+            by_id.setdefault(member['quality']['id'], member['quality']['name'])
+        by_id[entry.get('id')] = entry.get('name')
+        return ['group', entry.get('name'), bool(entry.get('allowed')),
+                [member['quality']['name'] for member in entry.get('items') or []]]
+    items = [item(entry) for entry in profile.get('items') or []]
+    shape = {'name': profile.get('name'),
+             'upgradeAllowed': bool(profile.get('upgradeAllowed')),
+             'cutoff': by_id.get(profile.get('cutoff')),
+             'items': items,
+             'minFormatScore': profile.get('minFormatScore'),
+             'cutoffFormatScore': profile.get('cutoffFormatScore'),
+             'minUpgradeFormatScore': profile.get('minUpgradeFormatScore'),
+             'formatItems': sorted((names.get(entry.get('format'), entry.get('name')), entry.get('score'))
+                                   for entry in profile.get('formatItems') or [])}
+    if 'language' in profile:
+        shape['language'] = (profile.get('language') or {}).get('id')
+    return shape
+
+
+def plan_profile(specs, app, formats, profiles, schema_profile):
+    specs = expand_profile_specs(specs)
+    if isinstance(specs.get(app), list):
+        names = [spec['name'] for spec in specs[app]]
+        if len(names) != len(set(names)):
+            raise PlanError('declared profile names repeat')
+        return [action for spec in specs[app]
+                for action in plan_profile({app: spec}, app, formats, profiles, schema_profile)]
+    spec = spec_for(specs, app)
+    body = profile_body(spec, formats, profiles, schema_profile, app)
+    matching = [p for p in profiles if p.get('name') in [spec['name']] + spec.get('renameFrom', [])]
+    if len(matching) > 1:
+        raise PlanError('multiple profiles match %s; resolve before renaming' % spec['name'])
+    current = matching[0] if matching else None
+    if current is None:
+        return [{'change': 'create', 'name': spec['name'], 'method': 'POST',
+                 'path': '/qualityprofile', 'body': body}]
+    if profile_shape(body, formats) == profile_shape(current, formats):
+        return [{'change': 'unchanged', 'name': spec['name']}]
+    body['id'] = current['id']
+    return [{'change': 'update', 'name': spec['name'], 'method': 'PUT',
+             'path': '/qualityprofile/%d' % current['id'], 'body': body}]
+
+
+def drift(actions):
+    return [action for action in actions if action['change'] != 'unchanged']
+
+
+
+def profile_id(profiles, name):
+    found = [p['id'] for p in profiles if p.get('name') == name]
+    if len(found) != 1:
+        raise PlanError('expected exactly one profile named %s, found %d' % (name, len(found)))
+    return found[0]
+
+
+def assignments(app, profiles, items):
+    counts = {}
+    names = {p['id']: p['name'] for p in profiles}
+    for entry in items:
+        name = names.get(entry.get('qualityProfileId'), 'unknown')
+        counts[name] = counts.get(name, 0) + 1
+    return {'app': app,
+            'profiles': {str(p['id']): p['name'] for p in profiles},
+            'counts': counts,
+            'items': {str(entry['id']): entry.get('qualityProfileId') for entry in items}}
+
+
+def editor_actions(app, groups):
+    """groups: {profile id: [item ids]} -> one editor PUT per target profile.
+    Only ids and the profile travel: no search, no move, no delete."""
+    path, key = EDITOR[app]
+    return [{'change': 'update', 'name': '%d items to profile %d' % (len(ids), target),
+             'method': 'PUT', 'path': path,
+             'body': {key: sorted(ids), 'qualityProfileId': target}}
+            for target, ids in sorted(groups.items()) if ids]
+
+
+def move_plan(app, profiles, items, source, target, limit=None):
+    if target == PROTECTED_PROFILE:
+        raise PlanError('refusing to move items onto %s; it is the import profile' % PROTECTED_PROFILE)
+    source_id, target_id = profile_id(profiles, source), profile_id(profiles, target)
+    ids = sorted(entry['id'] for entry in items if entry.get('qualityProfileId') == source_id)
+    if limit is not None:
+        ids = ids[:limit]
+    return editor_actions(app, {target_id: ids})
+
+
+def restore_plan(app, items, saved):
+    if saved.get('app') != app:
+        raise PlanError('the saved assignments are for %s, not %s' % (saved.get('app'), app))
+    recorded = {int(key): value for key, value in saved['items'].items()}
+    groups = {}
+    for entry in items:
+        want = recorded.get(entry['id'])
+        if want is not None and entry.get('qualityProfileId') != want:
+            groups.setdefault(want, []).append(entry['id'])
+    return editor_actions(app, groups)
+
+
+
+def emit(actions):
+    for action in actions:
+        print(json.dumps(action, sort_keys=True))
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog='arr-profiles')
+    sub = parser.add_subparsers(dest='command', required=True)
+    for name in ('plan-formats', 'verify-formats'):
+        command = sub.add_parser(name)
+        for option in ('--declared', '--live', '--schema'):
+            command.add_argument(option, required=True)
+    for name in ('plan-profile', 'verify-profile'):
+        command = sub.add_parser(name)
+        for option in ('--app', '--specs', '--formats', '--profiles', '--schema'):
+            command.add_argument(option, required=True)
+    command = sub.add_parser('assignments')
+    for option in ('--app', '--profiles', '--items'):
+        command.add_argument(option, required=True)
+    command = sub.add_parser('move-plan')
+    for option in ('--app', '--profiles', '--items', '--from', '--to'):
+        command.add_argument(option, required=True)
+    command.add_argument('--limit', type=int)
+    command = sub.add_parser('restore-plan')
+    for option in ('--app', '--items', '--saved'):
+        command.add_argument(option, required=True)
+    args = parser.parse_args(argv)
+
+    try:
+        if args.command in ('plan-formats', 'verify-formats'):
+            actions = plan_formats(load(args.declared), load(args.live), load(args.schema))
+        elif args.command in ('plan-profile', 'verify-profile'):
+            actions = plan_profile(load(args.specs), args.app, load(args.formats),
+                                   load(args.profiles), load(args.schema))
+        elif args.command == 'assignments':
+            print(json.dumps(assignments(args.app, load(args.profiles), load(args.items)),
+                             indent=1, sort_keys=True))
+            return 0
+        elif args.command == 'move-plan':
+            emit(move_plan(args.app, load(args.profiles), load(args.items),
+                           getattr(args, 'from'), args.to, args.limit))
+            return 0
+        else:
+            emit(restore_plan(args.app, load(args.items), load(args.saved)))
+            return 0
+    except PlanError as error:
+        print('arr-profiles: %s' % error, file=sys.stderr)
+        return 65
+
+    if args.command.startswith('verify-'):
+        for action in drift(actions):
+            print('%s: %s would be %sd' % (args.command, action['name'], action['change']),
+                  file=sys.stderr)
+        return 1 if drift(actions) else 0
+    emit(actions)
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

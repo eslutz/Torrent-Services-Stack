@@ -1,0 +1,4 @@
+[[roles]]
+name = "local-status"
+routes = ["GET /v1/vpn/status", "GET /v1/publicip/ip", "GET /v1/portforward"]
+auth = "none"

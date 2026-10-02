@@ -1,0 +1,49 @@
+#!/usr/bin/env python3
+"""Offline public stack verification; no private dependencies or live access."""
+import importlib.util
+import json
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+ROOT=Path(__file__).resolve().parents[1]
+subprocess.run([sys.executable,'-m','unittest','discover','tests'],cwd=ROOT,check=True)
+spec=importlib.util.spec_from_file_location('renderer',ROOT/'stack_renderer.py')
+r=importlib.util.module_from_spec(spec);spec.loader.exec_module(r)
+with tempfile.TemporaryDirectory() as temporary:
+    output=Path(temporary)/'rendered'
+    r.render(ROOT/'templates',json.loads((ROOT/'settings.example.json').read_text()),output)
+    for path in output.rglob('*'):
+        if not path.is_file():continue
+        text=path.read_text()
+        if text.startswith('#!/bin/sh'):
+            subprocess.run(['sh','-n',str(path)],check=True)
+        elif path.suffix=='.py':compile(text,str(path),'exec')
+    app=output/'opt/home-network/torrent-services'
+    import runpy
+    planner=runpy.run_path(str(output/'usr/local/libexec/home-network/arr-profiles'),run_name='stack_policy_verification')
+    policy=json.loads((app/'config/arr-profiles/quality-profiles.json').read_text())
+    profiles=planner['expand_profile_specs'](policy)
+    if not all(profiles.get(name) for name in ('sonarr','radarr')):raise SystemExit('example has no usable profiles')
+    for name in ('sonarr','radarr','local'):
+        document=json.loads((app/'config/arr-profiles'/f'{name}-custom-formats.json').read_text())
+        if not isinstance(document.get('formats'),list):raise SystemExit('invalid example custom-format input')
+    compose=(app/'compose.yaml').read_text()
+    qbt=(app/'config/qbittorrent/qBittorrent.conf').read_text()
+    for required in ['network_mode: service:gluetun','VPN_PORT_FORWARDING_UP_COMMAND','VPN_PORT_FORWARDING_DOWN_COMMAND','{{PORT}}','{{VPN_INTERFACE}}','cap_drop:','startPaused: "true"']:
+        if required not in compose:raise SystemExit('missing invariant: '+required)
+    if 'Session\\Interface=tun0' not in qbt or 'WebUI\\LocalHostAuth=false' not in qbt:raise SystemExit('qBittorrent isolation/hook contract changed')
+    lock=output/'etc/home-network/image-locks/torrent-services.env'
+    for line in lock.read_text().splitlines():
+        if line and not re.fullmatch(r'[A-Z_]+=[a-z0-9./_-]+@sha256:[a-f0-9]{64}',line):raise SystemExit('image must be digest-pinned')
+    if not shutil.which('docker'):raise SystemExit('Docker Compose is required for the full configuration gate')
+    subprocess.run(['docker','compose','--env-file',str(lock),'-f',str(app/'compose.yaml'),'config','--no-env-resolution','--no-path-resolution','--quiet'],check=True)
+for path in [ROOT/'settings.example.json',ROOT/'stack_renderer.py',*(ROOT/'templates').rglob('*')]:
+    if not path.is_file():continue
+    text=path.read_text()
+    if re.search(r'192\.168\.|\.home\.arpa|ericslutz\.dev|IPTORRENTS|1337x|BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY',text):raise SystemExit('non-generic publication input: '+str(path.relative_to(ROOT)))
+subprocess.run(['git','diff','--check'],cwd=ROOT,check=True)
+print('Public stack independent rendering, shell/Python syntax, Compose and isolation checks: PASS')

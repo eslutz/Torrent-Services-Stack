@@ -1,0 +1,96 @@
+#!/bin/sh
+set -eu
+
+
+compose_root=@@APP_ROOT@@/torrent-services
+media_mount=@@LIBRARY_MOUNT@@
+staging_mount=@@STAGING_MOUNT@@
+staging_marker=$staging_mount/.home-network-staging
+template="$compose_root/config/qbittorrent/qBittorrent.conf"
+runtime="$compose_root/data/qbittorrent/qBittorrent/qBittorrent.conf"
+definitions_template="$compose_root/config/prowlarr/Definitions/Custom"
+definitions_runtime="$compose_root/data/prowlarr/Definitions/Custom"
+providers_env=@@CONFIG_ROOT@@/secrets/media-providers.env
+
+fail() {
+  printf '%s\n' "$1" >&2
+  exit 69
+}
+
+[ "$(id -u)" -eq 0 ] || fail 'run as root'
+[ -r "$template" ] || fail "qBittorrent template is absent: $template"
+[ -d "$definitions_template" ] ||
+  fail "Prowlarr custom definition templates are absent: $definitions_template"
+
+for directory in qbittorrent qbittorrent/qBittorrent sonarr radarr prowlarr bazarr seerr swiparr; do
+  install -d -o @@MEDIA_ID@@ -g @@MEDIA_ID@@ -m 0750 "$compose_root/data/$directory"
+done
+install -d -o root -g root -m 0755 "$compose_root/data/gluetun"
+
+seed_secret() {
+  file=$1; name=$2; bytes=$3
+  if [ -s "$file" ]; then
+    printf 'secret already present, left untouched: %s\n' "$file"
+  else
+    ( umask 077; printf '%s=%s\n' "$name" "$(openssl rand -base64 "$bytes" | tr -d '\n')" > "$file" )
+    chown root:root "$file"; chmod 0600 "$file"
+    printf 'seeded secret: %s\n' "$file"
+  fi
+}
+install -d -o root -g root -m 0700 @@CONFIG_ROOT@@/secrets
+seed_secret @@CONFIG_ROOT@@/secrets/swiparr.env AUTH_SECRET 48
+seed_secret @@CONFIG_ROOT@@/secrets/torarr.env TOR_CONTROL_PASSWORD 24
+
+if [ -s @@CONFIG_ROOT@@/secrets/jellyfin-api-key ]; then
+  printf 'Jellyfin API key already present, left untouched: %s\n' @@CONFIG_ROOT@@/secrets/jellyfin-api-key
+else
+  ( umask 077; : > @@CONFIG_ROOT@@/secrets/jellyfin-api-key )
+  chown root:root @@CONFIG_ROOT@@/secrets/jellyfin-api-key
+  chmod 0600 @@CONFIG_ROOT@@/secrets/jellyfin-api-key
+  printf 'seeded empty Jellyfin API key file: %s\n' @@CONFIG_ROOT@@/secrets/jellyfin-api-key
+fi
+
+if [ -s "$providers_env" ]; then
+  printf 'provider credentials already present, left untouched: %s\n' "$providers_env"
+else
+  ( umask 077
+    cat <<'PROVIDERS'
+@@PROVIDER_ENV_TEMPLATE@@
+PROVIDERS
+  ) > "$providers_env"
+  chown root:root "$providers_env"; chmod 0600 "$providers_env"
+  printf 'seeded provider credential file: %s\n' "$providers_env"
+fi
+
+if [ -f "$runtime" ]; then
+  printf 'qBittorrent configuration already present, left untouched: %s\n' "$runtime"
+else
+  install -o @@MEDIA_ID@@ -g @@MEDIA_ID@@ -m 0640 "$template" "$runtime"
+  printf 'seeded qBittorrent configuration: %s\n' "$runtime"
+fi
+
+install -d -o @@MEDIA_ID@@ -g @@MEDIA_ID@@ -m 0750 "$definitions_runtime"
+for definition in "$definitions_template"/*.yml; do
+  [ -e "$definition" ] || continue
+  target="$definitions_runtime/$(basename "$definition")"
+  if cmp -s "$definition" "$target"; then
+    printf 'Prowlarr definition already current: %s\n' "$target"
+  else
+    install -o @@MEDIA_ID@@ -g @@MEDIA_ID@@ -m 0640 "$definition" "$target"
+    printf 'seeded Prowlarr definition (restart prowlarr to load): %s\n' "$target"
+  fi
+done
+
+mountpoint -q "$staging_mount" ||
+  fail "staging drive is not mounted, downloads tree not created: $staging_mount"
+for tree in downloads downloads/incomplete downloads/complete \
+  downloads/complete/movies downloads/complete/shows torrents; do
+  install -d -o @@MEDIA_ID@@ -g @@MEDIA_ID@@ -m 0750 "$staging_mount/$tree"
+done
+if [ -f "$staging_marker" ]; then
+  printf 'staging marker already present, left untouched: %s\n' "$staging_marker"
+else
+  install -o @@MEDIA_ID@@ -g @@MEDIA_ID@@ -m 0640 /dev/null "$staging_marker"
+  printf 'seeded staging marker: %s\n' "$staging_marker"
+fi
+printf 'downloads tree present under %s\n' "$staging_mount/downloads"

@@ -23,7 +23,7 @@ If you have an existing backup, this is the fastest path:
 
 ```bash
 # 1. Clone repository (if new host)
-git clone https://github.com/eslutz/Torrent-Services.git
+git clone https://github.com/eslutz/Torrent-Services-Stack.git
 cd Torrent-Services
 
 # 2. Restore configuration
@@ -276,7 +276,7 @@ On old host:
 On new host:
 ```bash
 # 1. Clone repository
-git clone https://github.com/eslutz/Torrent-Services.git
+git clone https://github.com/eslutz/Torrent-Services-Stack.git
 cd Torrent-Services
 
 # 2. Copy backup from external drive to ./backups/

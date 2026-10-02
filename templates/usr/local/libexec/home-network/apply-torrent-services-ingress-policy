@@ -1,0 +1,25 @@
+#!/bin/sh
+set -eu
+
+
+services_interface=eth0
+chain=@@INGRESS_CHAIN@@
+monitoring_host=@@MONITORING_ADDRESS@@
+ports=4321,5055,6767,7878,8080,8265,8989,9696
+metrics_ports=5656,7100,8090,9091,12345
+
+/usr/sbin/iptables -N "$chain" 2>/dev/null || true
+/usr/sbin/iptables -F "$chain"
+for source in @@PROXY_A_ADDRESS@@ @@PROXY_B_ADDRESS@@; do
+  /usr/sbin/iptables -A "$chain" -s "$source" -p tcp -m multiport --dports "$ports" -j RETURN
+done
+/usr/sbin/iptables -A "$chain" -s "$monitoring_host" -p tcp -m multiport --dports "$metrics_ports" -j RETURN
+/usr/sbin/iptables -A "$chain" -p tcp -m multiport --dports "$ports,$metrics_ports" -j DROP
+/usr/sbin/iptables -A "$chain" -j RETURN
+
+if ! /usr/sbin/iptables -C DOCKER-USER -i "$services_interface" -j "$chain" >/dev/null 2>&1; then
+  /usr/sbin/iptables -I DOCKER-USER 1 -i "$services_interface" -j "$chain"
+fi
+
+printf 'torrent ingress policy applied: web backends only from both proxy hosts; metrics only from %s\n' \
+  "$monitoring_host"

@@ -1,143 +1,18 @@
-# Torrent-Services
+# Torrent-Services-Stack
 
-Media automation stack with qBittorrent, Gluetun (VPN), Prowlarr, Sonarr, Radarr, Bazarr, Unpackarr (wrapper), Tdarr, Forwardarr, and optional monitoring/exporters.
+[![Verify](https://github.com/eslutz/Torrent-Services-Stack/actions/workflows/ci.yml/badge.svg)](https://github.com/eslutz/Torrent-Services-Stack/actions/workflows/ci.yml)
 
-[![CI Pipeline](https://github.com/eslutz/Torrent-Services/actions/workflows/ci.yml/badge.svg)](https://github.com/eslutz/Torrent-Services/actions/workflows/ci.yml) [![Security Analysis](https://github.com/eslutz/Torrent-Services/actions/workflows/security.yml/badge.svg)](https://github.com/eslutz/Torrent-Services/actions/workflows/security.yml)
+Reusable Linux media stack with pinned images, Proton WireGuard isolation, forwarded-port synchronization, mount guards, authenticated applications, bounded logs and optional exporters. Python tooling uses only the standard library. It works independently of private infrastructure repositories. The existing public Git history is preserved; `legacy/` is reference material and `v2/` is a preserved local experiment.
 
-## What's Included
+## Setup
 
-| Component | Local URL | Details |
-| --- | --- | --- |
-| [qBittorrent](https://www.qbittorrent.org) | <http://localhost:8080> | Torrent client behind VPN; use `gluetun:8080` from other containers |
-| [Gluetun](https://github.com/qdm12/gluetun) | n/a | VPN client (WireGuard/OpenVPN) with optional port forwarding; shared network namespace for qBittorrent |
-| [Prowlarr](https://github.com/Prowlarr/Prowlarr) | <http://localhost:9696> | Indexer manager feeding Sonarr/Radarr; configure indexers first |
-| [Sonarr](https://github.com/Sonarr/Sonarr) | <http://localhost:8989> | TV show automation; API key set in app UI and `.env` |
-| [Radarr](https://github.com/Radarr/Radarr) | <http://localhost:7878> | Movie automation; API key set in app UI and `.env` |
-| [Bazarr](https://github.com/morpheus65535/bazarr) | <http://localhost:6767> | Subtitles; configure providers via UI |
-| [Unpackarr](https://github.com/eslutz/Unpackarr) | <http://localhost:9092> | Wrapper around official Unpackerr that extracts completed downloads for *arr apps; wrapper health endpoint at :9092, optional Unpackerr metrics at :5656 |
-| [Tdarr](https://github.com/HaveAGitGat/Tdarr) | <http://localhost:8265> | Optional transcoding with helper scripts for extra nodes; use scripts to add nodes |
-| [Forwardarr](https://github.com/eslutz/Forwardarr) | <http://127.0.0.1:9090/metrics> | Syncs VPN forwarded port into qBittorrent; port sync + metrics |
-| [Torarr](https://github.com/eslutz/Torarr) (optional) | <http://127.0.0.1:8085/metrics> | SOCKS5 proxy for Tor-only indexers; Tor bootstrap/metrics |
-| [Scraparr](https://github.com/thecfu/scraparr) / [qbittorrent-exporter](https://github.com/martabal/qbittorrent-exporter) (optional) | <http://127.0.0.1:7100/metrics> / <http://127.0.0.1:8090/metrics> | Prometheus metrics for qBittorrent, Forwardarr, Torarr, *arr apps; exporters only |
-| [Jellyseerr](https://github.com/Fallenbagel/jellyseerr) (optional) | <http://localhost:5055> | Requests UI; connect to Sonarr/Radarr |
-| [Swiparr](https://github.com/m3sserstudi0s/swiparr) (optional) | <http://localhost:4321> | Jellyfin swipe discovery UI |
+1. Install Python 3.11+, Docker Engine with Compose v2 supporting optional env files, Linux kernel WireGuard, findmnt, setpriv, curl and OpenSSL. Create the `torrent-services` group and account with the UID/GID selected in settings. Read the rendered shell helpers before running them; seeding and application wiring modify the deployment.
+2. Copy settings.example.json to an ignored settings.local.json. Choose the bind address, library/staging mounts, NFS source, timezone, VPN country/cities, HTTPS application origins, proxy addresses and monitoring destination. Documentation annotations are optional; they cannot inject executable lines. Profile policy is input data. Start with no configured indexers (`[]`) in the non-secret INDEXER_POLICY input. Provider credentials are optional native files, never a private repository credential catalog.
+3. Run `python3 stack_renderer.py --settings settings.local.json --output rendered`. The renderer refuses an existing output directory; use a fresh candidate path for every revision. Templates preserve `${IMAGE}` and Gluetun's `{{PORT}}`/`{{VPN_INTERFACE}}` tokens literally. Review the output and pinned image lock. Relative template paths describe the original root-filesystem layout; install their contents at the absolute APP_ROOT, CONFIG_ROOT and LIBEXEC_ROOT selected in settings rather than blindly copying those layout prefixes.
+4. Mount the staging filesystem (ext4 with the expected label) and library NFS export first. Create the documented library directories and readiness marker expected by the rendered guard. Run the rendered seed helper once. Keep mountpoints inaccessible when unmounted, and arrange a systemd pre-start readiness check before any core profile activation. qBittorrent writes and seeds on staging; applications copy completed files to the library.
+5. Store the Proton WireGuard key in CONFIG_ROOT/secrets/proton-wireguard-private-key, root:root 0600. Store the qBittorrent password in CONFIG_ROOT/secrets/qbittorrent-webui-password, root:torrent-services 0640. Seeded Swiparr/Torarr native env files remain root:root 0600. Never print credentials, place them in command arguments, or commit runtime state. Fill optional provider fields locally, and provide Jellyfin's API key only if using notifications. The reusable wiring helper skips empty optional credentials.
+6. Put every web UI behind an HTTPS reverse proxy. Configure per-name certificates and forward Host/X-Forwarded headers. Install the rendered ingress policy with your approved proxy and monitoring source addresses before publishing backend ports; its DOCKER-USER restrictions protect same-subnet traffic. Allow plaintext backends only from those proxy hosts. Provide the trusted public CA file expected by the exporter; it is client trust, not a private key.
+7. Install the rendered helpers, config and lock at the chosen paths. Run verify-torrent-readiness first. Then use `docker compose -p torrent-services --env-file <installed-image-lock> -f <installed-compose> --profile torrent-ready up -d`. Complete first-run admin setup before admitting other clients. Run wire-torrent-apps only after reviewing your provider/profile policy; it configures applications and starts the integrations profile. Monitoring is a separate optional profile. Media conversion remains opt-in, with the node paused and library mounts read-only; this setup does not activate it.
+8. Run `./scripts/verify`. Check container health, trusted HTTPS and proxy headers from a client, denial from a non-proxy source, mounts as the exact media UID, VPN egress/DNS isolation, forwarded-port synchronization, reconnection behavior, import Copy behavior and continued seeding. Capture a predecessor and rollback before any deployment update. Source checks alone do not prove these runtime properties.
 
-### Core Patterns
-
-- Backup/restore first: configure via web UIs, then capture state with `scripts/utilities/backup_config.sh`; restore with `scripts/utilities/restore_config.sh`.
-- VPN network sharing: qBittorrent runs with `network_mode: service:gluetun`; in other services, reach it at `gluetun:8080`.
-- Health-gated startup: each service waits for API health checks (with specified timeouts) before others start; autoheal restarts unhealthy containers.
-- Resource limits: controlled by env vars in `.env` (mem/cpu defaults per service); no YAML edits required.
-
-## Quick Start (fresh install)
-
-For step-by-step details, see [scripts/setup/SETUP.md](scripts/setup/SETUP.md).
-
-```bash
-cp .env.example .env
-# Edit .env: VPN credentials, service passwords, resource limits
-docker compose up -d
-# Configure Prowlarr, Sonarr, Radarr, Bazarr, qBittorrent via their UIs
-./scripts/utilities/backup_config.sh
-```
-
-## Quick Restore (from backup)
-
-```bash
-./scripts/utilities/restore_config.sh ./backups/<timestamp>
-# Follow on-screen UI restore steps for *arr apps
-docker compose ps
-```
-
-## VPN Setup
-
-- Use any VPN provider supported by Gluetun (WireGuard or OpenVPN). Port forwarding improves seeding; choose a provider/location that offers it.
-- Populate `.env` with the provider config from `.env.example` (e.g., `WIREGUARD_PRIVATE_KEY`, `WIREGUARD_ADDRESSES`, or OpenVPN creds). Leave empty values blank until you have them.
-- Start the stack, then verify:
-
-```bash
-docker compose logs gluetun --tail 50         # tunnel up and provider details
-docker exec gluetun cat /tmp/gluetun/forwarded_port  # forwarded port (if supported)
-docker logs forwardarr --tail 20              # qBittorrent port sync
-```
-
-If your provider does not support forwarding, Forwardarr will log that no port was found; the stack still works, but seeding may be slower.
-
-## Health, Autoheal, Monitoring
-
-- Health scripts live in `scripts/healthchecks/` and gate startup; check with `docker compose ps` for `healthy` statuses.
-- Autoheal monitors container health and restarts stuck services with optional circuit breaker (enabled by default; configurable via `DEFAULT_STOP` and `MAX_RETRIES`).
-- Email notifications sent for container failures with detailed diagnostic information.
-- Monitoring profile (optional): set `ENABLE_MONITORING_PROFILE=true` in `.env`, then run `docker compose --profile monitoring up -d` for exporters. Prometheus/Grafana are not bundled.
-
-For detailed information on health check intervals, timeouts, email notifications, and troubleshooting, see [scripts/healthchecks/HEALTHCHECKS.md](scripts/healthchecks/HEALTHCHECKS.md).
-
-## Logging
-
-All services write date-based logs for easy troubleshooting and analysis:
-
-- **Healthcheck logs**: Custom health check output at `logs/<service>/healthcheck-YYYY.MM.DD.log`
-- **Application logs**: Docker container output streamed to `logs/<service>/<service>-YYYY.MM.DD.log`
-
-Logs automatically rotate daily and old files are cleaned up after `LOG_KEEP_ROTATIONS` days (default: 7). You can also view live logs directly from Docker with `docker logs -f <service>` or use `docker compose logs -f <service>`. For detailed information on log formats, viewing live logs, rotation behavior, and troubleshooting, see [scripts/utilities/LOG_MANAGEMENT.md](scripts/utilities/LOG_MANAGEMENT.md).
-
-### Exporter endpoints (localhost only)
-
-| Service | Endpoint |
-| --- | --- |
-| qBittorrent exporter | <http://127.0.0.1:8090/metrics> |
-| Forwardarr | <http://127.0.0.1:9090/metrics> |
-| Torarr | <http://127.0.0.1:8085/metrics> |
-| Scraparr (*arr aggregate) | <http://127.0.0.1:7100/metrics> |
-
-## Common commands
-
-```bash
-docker compose up -d                         # Start stack
-docker compose down                          # Stop stack
-docker compose restart <service>             # Restart one service
-docker compose logs -f <service>             # Tail logs
-docker compose --profile monitoring up -d    # Start exporters
-./scripts/utilities/backup_config.sh         # Snapshot configs
-./scripts/utilities/restore_config.sh <dir>  # Restore configs
-```
-
-## Tdarr node helpers
-
-- Add a node: `./scripts/utilities/start_tdarr_node.sh`
-- Manage nodes: `./scripts/utilities/manage_tdarr_nodes.sh list|stop|stop-all`
-- Per-node overrides: flags on the helper scripts (CPU/GPU workers, limits) or env vars in `.env`.
-
-## Utility Scripts
-
-The `scripts/utilities/` directory contains helpful automation scripts:
-
-- **manage_storage.py** - Add/remove storage volumes with automatic service configuration
-- **vpn_speedtest.py** - Test VPN connection and throughput
-- **check_torrent_status.py** - View torrent status and analyze stalled downloads
-- **manage_torrents.py** - Fix save paths and delete broken torrents
-- **rescan_missing_media.py** - Detect missing files and trigger re-downloads
-- **sync_api_keys.py** - Sync API keys between Prowlarr, Sonarr, and Radarr
-- **Backup/restore scripts** - Capture and restore service configurations
-
-For complete usage instructions and examples, see [scripts/utilities/UTILITIES.md](scripts/utilities/UTILITIES.md).
-
-## Troubleshooting quick checks
-
-- VPN/port forwarding: `docker exec gluetun cat /tmp/gluetun/forwarded_port`; if empty, confirm provider supports forwarding and restart Gluetun.
-- qBittorrent unconnectable: verify Forwardarr logs show a port update; ensure `QBITTORRENT_PASSWORD` is set in `.env`; restart `qbittorrent` and `forwardarr`.
-- *arr cannot reach qBittorrent: host should be `gluetun` and port `8080`; test from a container: `docker exec sonarr curl -sf http://gluetun:8080`.
-- Slow health startup: check scripts in `scripts/healthchecks/` and confirm upstream services are reachable; health checks allow up to ~20-60s per probe (depending on service).
-
-## Security
-
-- Never commit `.env` (contains VPN credentials and service secrets; excluded via `.gitignore`)
-- VPN kill-switch enforced: if the tunnel drops, qBittorrent loses internet access
-- Port forwarding (when supported by your VPN) is synced automatically into qBittorrent via Forwardarr
-- All torrent traffic is forced through the VPN interface
-
-## Contributing
-
-- Open issues or pull requests on GitHub with a clear description and reproduction steps if applicable.
-- Follow existing patterns and environment-based configuration; do not hardcode credentials or resource limits.
-- Run `venv/bin/pre-commit run --all-files` before submitting.
+Pinned image upgrades are reviewed changes. Do not replace locks with floating tags. Keep deployment authorization separate from source revisions. See NOTICE.md for provenance and upstream attribution.
