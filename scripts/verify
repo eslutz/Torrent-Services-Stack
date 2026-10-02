@@ -41,7 +41,7 @@ with tempfile.TemporaryDirectory() as temporary:
         if line and not re.fullmatch(r'[A-Z_]+=[a-z0-9./_-]+@sha256:[a-f0-9]{64}',line):raise SystemExit('image must be digest-pinned')
     if not shutil.which('docker'):raise SystemExit('Docker Compose is required for the full configuration gate')
     subprocess.run(['docker','compose','--env-file',str(lock),'-f',str(app/'compose.yaml'),'config','--no-env-resolution','--no-path-resolution','--quiet'],check=True)
-for path in [ROOT/'settings.example.json',ROOT/'stack_renderer.py',*(ROOT/'templates').rglob('*')]:
+for path in [ROOT/'settings.example.json',ROOT/'stack_renderer.py',ROOT/'scripts/audit_python_dependencies.py',*(ROOT/'templates').rglob('*')]:
     if not path.is_file():continue
     text=path.read_text()
     if re.search(r'192\.168\.|\.home\.arpa|ericslutz\.dev|IPTORRENTS|1337x|BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY',text):raise SystemExit('non-generic publication input: '+str(path.relative_to(ROOT)))
