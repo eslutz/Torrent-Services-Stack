@@ -6,8 +6,167 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.0.0
         with:
           python-version: "3.11"
       - run: ./scripts/verify
+  validate-docker-compose:
+    name: Validate Docker Compose
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.11"
+      - name: Render generic deployment
+        run: python3 stack_renderer.py --settings settings.example.json --output "$RUNNER_TEMP/torrent-stack"
+      - name: Validate rendered Compose configuration
+        run: >-
+          docker compose
+          --env-file "$RUNNER_TEMP/torrent-stack/etc/home-network/image-locks/torrent-services.env"
+          -f "$RUNNER_TEMP/torrent-stack/opt/home-network/torrent-services/compose.yaml"
+          config --no-env-resolution --no-path-resolution --quiet
+  validate-environment:
+    name: Validate Environment
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.11"
+      - name: Render and inspect every template
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          import re
+          import tempfile
+          import stack_renderer
+
+          root = Path.cwd()
+          templates = root / "templates"
+          with tempfile.TemporaryDirectory() as temporary:
+              output = Path(temporary) / "rendered"
+              stack_renderer.render(
+                  templates,
+                  json.loads((root / "settings.example.json").read_text()),
+                  output,
+              )
+              source_files = {
+                  path.relative_to(templates).as_posix()
+                  for path in templates.rglob("*")
+                  if path.is_file()
+              }
+              rendered_files = {
+                  path.relative_to(output).as_posix()
+                  for path in output.rglob("*")
+                  if path.is_file()
+              }
+              if source_files != rendered_files:
+                  raise SystemExit("rendered file set differs from templates")
+              token = re.compile(r"@@[A-Z][A-Z0-9_]*@@")
+              for path in output.rglob("*"):
+                  if path.is_file() and token.search(path.read_text()):
+                      raise SystemExit(f"unresolved template setting: {path.relative_to(output)}")
+          print(f"Rendered and validated {len(rendered_files)} generic templates")
+          PY
+  validate-shell:
+    name: Validate Shell Scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.11"
+      - name: Render and parse all shell helpers
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          import subprocess
+          import tempfile
+          import stack_renderer
+
+          root = Path.cwd()
+          with tempfile.TemporaryDirectory() as temporary:
+              output = Path(temporary) / "rendered"
+              stack_renderer.render(
+                  root / "templates",
+                  json.loads((root / "settings.example.json").read_text()),
+                  output,
+              )
+              scripts = [
+                  path for path in output.rglob("*")
+                  if path.is_file() and path.open().readline().startswith("#!/bin/sh")
+              ]
+              if not scripts:
+                  raise SystemExit("no rendered shell helpers found")
+              for script in scripts:
+                  subprocess.run(["sh", "-n", str(script)], check=True)
+          print(f"Parsed {len(scripts)} rendered shell helpers")
+          PY
+  lint-shell:
+    name: Lint Shell
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.11"
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install --yes shellcheck
+      - name: Render and lint all shell helpers
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          import subprocess
+          import tempfile
+          import stack_renderer
+
+          root = Path.cwd()
+          with tempfile.TemporaryDirectory() as temporary:
+              output = Path(temporary) / "rendered"
+              stack_renderer.render(
+                  root / "templates",
+                  json.loads((root / "settings.example.json").read_text()),
+                  output,
+              )
+              scripts = [
+                  path for path in output.rglob("*")
+                  if path.is_file() and path.open().readline().startswith("#!/bin/sh")
+              ]
+              if not scripts:
+                  raise SystemExit("no rendered shell helpers found")
+              for script in scripts:
+                  subprocess.run(
+                      ["shellcheck", "--shell=sh", "--severity=warning", str(script)],
+                      check=True,
+                  )
+          print(f"ShellCheck passed for {len(scripts)} rendered shell helpers")
+          PY
+  lint-python:
+    name: Lint Python
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.11"
+      - name: Install Ruff
+        run: python3 -m pip install --disable-pip-version-check ruff==0.16.8
+      - name: Lint active Python sources
+        run: >-
+          ruff check --select E4,E7,E9,F --ignore E701,E702 --no-cache
+          stack_renderer.py scripts/verify scripts/audit_python_dependencies.py
+          tests templates/usr/local/libexec/home-network/arr_analytics.py
+  tests:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.11"
+      - run: python3 -m unittest discover tests

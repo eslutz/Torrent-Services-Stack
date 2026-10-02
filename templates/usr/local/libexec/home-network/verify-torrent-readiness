@@ -3,7 +3,7 @@ set -eu
 
 
 media_mount=@@LIBRARY_MOUNT@@
-media_host=@@LIBRARY_SERVER_HOST@@
+media_host="@@LIBRARY_SERVER_HOST@@"
 media_export=@@LIBRARY_EXPORT_PATH@@
 media_source=$media_host:$media_export
 staging_mount=@@STAGING_MOUNT@@
