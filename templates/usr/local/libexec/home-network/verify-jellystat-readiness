@@ -1,0 +1,26 @@
+#!/bin/sh
+set -eu
+python3 - '@@CONFIG_ROOT@@/secrets' <<'PY'
+from pathlib import Path
+import os, stat, sys
+path = Path(sys.argv[1])
+for parent in (path, *path.parents):
+    info = parent.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+        raise SystemExit('Jellystat requires root-owned, non-writable credential ancestry: ' + str(parent))
+PY
+for name in jellystat-db-password jellystat-jwt-secret; do
+  file=@@CONFIG_ROOT@@/secrets/$name
+  [ -s "$file" ] && [ ! -L "$file" ] && [ "$(stat -c '%u:%g %a' "$file")" = '0:0 600' ] || {
+    echo "Jellystat requires a nonempty root:root 0600 runtime secret: $name" >&2; exit 1;
+  }
+done
+test -r @@CONFIG_ROOT@@/ca/@@CLIENT_CA_FILENAME@@
+for name in JELLYSTAT_IMAGE JELLYSTAT_DB_IMAGE; do
+  grep -Eq "^$name=[a-z0-9./_-]+@sha256:[a-f0-9]{64}$" @@CONFIG_ROOT@@/image-locks/torrent-services.env
+done
+test -d @@STATE_ROOT@@/jellystat/backup-data
+test -d @@STATE_ROOT@@/jellystat/postgres
+[ "$(stat -c '%u:%g %a' @@STATE_ROOT@@/jellystat/postgres)" = '999:999 700' ] || {
+  echo 'Jellystat PostgreSQL bind directory requires UID/GID 999:999 and mode 0700' >&2; exit 1;
+}

@@ -1,0 +1,76 @@
+# Optional overlay: explicitly select this file and the jellystat profile.
+# PostgreSQL 18 stores versioned PGDATA beneath /var/lib/postgresql.
+services:
+  jellystat-db:
+    image: ${JELLYSTAT_DB_IMAGE:?JELLYSTAT_DB_IMAGE must come from the fixed image lock}
+    profiles: [jellystat]
+    container_name: jellystat-db
+    restart: unless-stopped
+    mem_limit: 192m
+    shm_size: 64m
+    command: [postgres, -c, shared_buffers=32MB, -c, max_connections=30]
+    environment:
+      POSTGRES_USER: jellystat
+      POSTGRES_DB: jfstat
+      POSTGRES_PASSWORD_FILE: /run/secrets/jellystat-db-password
+    secrets: [jellystat-db-password]
+    volumes:
+      - @@STATE_ROOT@@/jellystat/postgres:/var/lib/postgresql
+    networks: [jellystat-db]
+    healthcheck:
+      test: [CMD, pg_isready, -U, jellystat, -d, jfstat]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    logging:
+      driver: json-file
+      options: {max-size: 10m, max-file: "3"}
+    security_opt: [no-new-privileges:true]
+
+  jellystat:
+    image: ${JELLYSTAT_IMAGE:?JELLYSTAT_IMAGE must come from the fixed image lock}
+    profiles: [jellystat]
+    container_name: jellystat
+    restart: unless-stopped
+    mem_limit: 384m
+    depends_on:
+      jellystat-db: {condition: service_healthy}
+    environment:
+      POSTGRES_USER: jellystat
+      POSTGRES_DB: jfstat
+      POSTGRES_IP: jellystat-db
+      POSTGRES_PORT: "5432"
+      FILE__POSTGRES_PASSWORD: /run/secrets/jellystat-db-password
+      FILE__JWT_SECRET: /run/secrets/jellystat-jwt-secret
+      TZ: @@TIMEZONE@@
+      NODE_EXTRA_CA_CERTS: /run/trust/root.pem
+      REJECT_SELF_SIGNED_CERTIFICATES: "true"
+      JF_USE_WEBSOCKETS: "true"
+    secrets: [jellystat-db-password, jellystat-jwt-secret]
+    volumes:
+      - @@CONFIG_ROOT@@/ca/@@CLIENT_CA_FILENAME@@:/run/trust/root.pem:ro
+      - @@STATE_ROOT@@/jellystat/backup-data:/app/backend/backup-data
+    ports:
+      - "127.0.0.1:3000:3000"
+      - "@@MEDIA_ADDRESS@@:3000:3000"
+    networks: [default, jellystat-db]
+    healthcheck:
+      test: [CMD, wget, -q, -O, /dev/null, http://127.0.0.1:3000/auth/isConfigured]
+      interval: 30s
+      timeout: 5s
+      retries: 6
+      start_period: 60s
+    logging:
+      driver: json-file
+      options: {max-size: 10m, max-file: "3"}
+    security_opt: [no-new-privileges:true]
+
+networks:
+  jellystat-db:
+    internal: true
+
+secrets:
+  jellystat-db-password:
+    file: @@CONFIG_ROOT@@/secrets/jellystat-db-password
+  jellystat-jwt-secret:
+    file: @@CONFIG_ROOT@@/secrets/jellystat-jwt-secret
