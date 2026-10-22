@@ -813,7 +813,7 @@ arr_naming sonarr 127.0.0.1:8989/api/v3 <<'SONARR_NAMING'
  "animeEpisodeFormat": "{Series Title} - S{season:00}E{episode:00} - {Episode Title}",
  "seriesFolderFormat": "{Series Title} ({Series Year})",
  "seasonFolderFormat": "Season {season}",
- "specialsFolderFormat": "Extras",
+ "specialsFolderFormat": "Season 00",
  "multiEpisodeStyle": 5,
  "replaceIllegalCharacters": true}
 SONARR_NAMING
