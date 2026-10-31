@@ -3,7 +3,6 @@ set -eu
 
 
 compose_root=@@APP_ROOT@@/torrent-services
-media_mount=@@LIBRARY_MOUNT@@
 staging_mount=@@STAGING_MOUNT@@
 staging_marker=$staging_mount/.home-network-staging
 template="$compose_root/config/qbittorrent/qBittorrent.conf"

@@ -8,7 +8,6 @@ interval=${MEASURE_INTERVAL:-10}
 run_torrent=no
 use_tmpfs=no
 list_servers=no
-compose_root=@@APP_ROOT@@/torrent-services
 image_lock=@@CONFIG_ROOT@@/image-locks/torrent-services.env
 
 usage() {

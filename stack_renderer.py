@@ -11,7 +11,7 @@ TOKEN = re.compile(r'@@([A-Z][A-Z0-9_]*)@@')
 
 def render(templates, settings, output):
     templates, output = Path(templates), Path(output)
-    values = settings.get('values', {})
+    values = {'OPTIONAL_WEB_PORTS': '', **settings.get('values', {})}
     comments = settings.get('comments', {})
     if 'INDEXER_POLICY' in values and not isinstance(json.loads(values['INDEXER_POLICY']), list):
         raise ValueError('indexer policy must be a JSON array')

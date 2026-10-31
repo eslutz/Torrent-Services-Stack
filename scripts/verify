@@ -41,7 +41,7 @@ with tempfile.TemporaryDirectory() as temporary:
         if line and ('=' not in line or not r.valid_image_reference(line.split('=', 1)[1])):raise SystemExit('image needs an explicit channel or recovery digest')
     if not shutil.which('docker'):raise SystemExit('Docker Compose is required for the full configuration gate')
     subprocess.run(['docker','compose','--env-file',str(lock),'-f',str(app/'compose.yaml'),'config','--no-env-resolution','--no-path-resolution','--quiet'],check=True)
-for path in [ROOT/'settings.example.json',ROOT/'stack_renderer.py',*(ROOT/'templates').rglob('*')]:
+for path in [ROOT/'settings.example.json',ROOT/'stack_renderer.py',ROOT/'scripts/audit_python_dependencies.py',*(ROOT/'templates').rglob('*')]:
     if not path.is_file():continue
     text=path.read_text()
     if re.search(r'192\.168\.|\.home\.arpa|ericslutz\.dev|IPTORRENTS|1337x|BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY',text):raise SystemExit('non-generic publication input: '+str(path.relative_to(ROOT)))
