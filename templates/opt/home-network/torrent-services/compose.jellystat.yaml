@@ -2,7 +2,7 @@
 # PostgreSQL 18 stores versioned PGDATA beneath /var/lib/postgresql.
 services:
   jellystat-db:
-    image: ${JELLYSTAT_DB_IMAGE:?JELLYSTAT_DB_IMAGE must come from the fixed image lock}
+    image: ${JELLYSTAT_DB_IMAGE:?JELLYSTAT_DB_IMAGE must name an explicit update channel}
     profiles: [jellystat]
     container_name: jellystat-db
     restart: unless-stopped
@@ -28,7 +28,7 @@ services:
     security_opt: [no-new-privileges:true]
 
   jellystat:
-    image: ${JELLYSTAT_IMAGE:?JELLYSTAT_IMAGE must come from the fixed image lock}
+    image: ${JELLYSTAT_IMAGE:?JELLYSTAT_IMAGE must name an explicit update channel}
     profiles: [jellystat]
     container_name: jellystat
     restart: unless-stopped
