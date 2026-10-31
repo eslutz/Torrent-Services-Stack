@@ -46,3 +46,11 @@ class AnnotationBoundaryTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 renderer.render(source,{'values':{},'comments':{'helper':[[1,'# comment\necho unsafe\n']]}},root/'output')
             self.assertFalse((root/'output').exists())
+
+class ImageReferenceTests(unittest.TestCase):
+    def test_channels_and_recovery_digests_are_valid_but_implicit_tags_are_not(self):
+        for value in ('postgres:17', 'grafana/alloy:latest', 'portainer/portainer-ce:lts',
+                      'example/app@sha256:' + 'a' * 64):
+            self.assertTrue(renderer.valid_image_reference(value), value)
+        for value in ('postgres', 'repo/app:', 'repo/app:latest;id', 'repo/app@sha256:short'):
+            self.assertFalse(renderer.valid_image_reference(value), value)

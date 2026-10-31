@@ -8,7 +8,7 @@ x-media-logging: &media-logging
 
 services:
   gluetun:
-    image: ${GLUETUN_IMAGE:?GLUETUN_IMAGE must come from the fixed image lock}
+    image: ${GLUETUN_IMAGE:?GLUETUN_IMAGE must name an explicit update channel}
     container_name: gluetun
     profiles:
       - torrent-ready
@@ -53,7 +53,7 @@ services:
       - no-new-privileges:true
 
   qbittorrent:
-    image: ${QBITTORRENT_IMAGE:?QBITTORRENT_IMAGE must come from the fixed image lock}
+    image: ${QBITTORRENT_IMAGE:?QBITTORRENT_IMAGE must name an explicit update channel}
     container_name: qbittorrent
     profiles:
       - torrent-ready
@@ -94,7 +94,7 @@ services:
       - no-new-privileges:true
 
   sonarr:
-    image: ${SONARR_IMAGE:?SONARR_IMAGE must come from the fixed image lock}
+    image: ${SONARR_IMAGE:?SONARR_IMAGE must name an explicit update channel}
     container_name: sonarr
     profiles:
       - torrent-ready
@@ -131,7 +131,7 @@ services:
       - no-new-privileges:true
 
   radarr:
-    image: ${RADARR_IMAGE:?RADARR_IMAGE must come from the fixed image lock}
+    image: ${RADARR_IMAGE:?RADARR_IMAGE must name an explicit update channel}
     container_name: radarr
     profiles:
       - torrent-ready
@@ -168,7 +168,7 @@ services:
       - no-new-privileges:true
 
   prowlarr:
-    image: ${PROWLARR_IMAGE:?PROWLARR_IMAGE must come from the fixed image lock}
+    image: ${PROWLARR_IMAGE:?PROWLARR_IMAGE must name an explicit update channel}
     container_name: prowlarr
     profiles:
       - torrent-ready
@@ -199,7 +199,7 @@ services:
       - no-new-privileges:true
 
   bazarr:
-    image: ${BAZARR_IMAGE:?BAZARR_IMAGE must come from the fixed image lock}
+    image: ${BAZARR_IMAGE:?BAZARR_IMAGE must name an explicit update channel}
     container_name: bazarr
     profiles:
       - torrent-ready
@@ -233,7 +233,7 @@ services:
       - no-new-privileges:true
 
   torarr:
-    image: ${TORARR_IMAGE:?TORARR_IMAGE must come from the fixed image lock}
+    image: ${TORARR_IMAGE:?TORARR_IMAGE must name an explicit update channel}
     container_name: torarr
     profiles:
       - torrent-ready
@@ -267,7 +267,7 @@ services:
       - no-new-privileges:true
 
   flaresolverr:
-    image: ${FLARESOLVERR_IMAGE:?FLARESOLVERR_IMAGE must come from the fixed image lock}
+    image: ${FLARESOLVERR_IMAGE:?FLARESOLVERR_IMAGE must name an explicit update channel}
     container_name: flaresolverr
     profiles:
       - torrent-ready
@@ -297,7 +297,7 @@ services:
       - no-new-privileges:true
 
   seerr:
-    image: ${SEERR_IMAGE:?SEERR_IMAGE must come from the fixed image lock}
+    image: ${SEERR_IMAGE:?SEERR_IMAGE must name an explicit update channel}
     container_name: seerr
     profiles:
       - torrent-ready
@@ -333,7 +333,7 @@ services:
       - no-new-privileges:true
 
   swiparr:
-    image: ${SWIPARR_IMAGE:?SWIPARR_IMAGE must come from the fixed image lock}
+    image: ${SWIPARR_IMAGE:?SWIPARR_IMAGE must name an explicit update channel}
     container_name: swiparr
     profiles:
       - torrent-ready
@@ -374,7 +374,7 @@ services:
       - no-new-privileges:true
 
   unpackerr:
-    image: ${UNPACKERR_IMAGE:?UNPACKERR_IMAGE must come from the fixed image lock}
+    image: ${UNPACKERR_IMAGE:?UNPACKERR_IMAGE must name an explicit update channel}
     container_name: unpackerr
     profiles:
       - torrent-integrations
@@ -424,7 +424,7 @@ services:
       - no-new-privileges:true
 
   scraparr:
-    image: ${SCRAPARR_IMAGE:?SCRAPARR_IMAGE must come from the fixed image lock}
+    image: ${SCRAPARR_IMAGE:?SCRAPARR_IMAGE must name an explicit update channel}
     container_name: scraparr
     profiles:
       - torrent-integrations
@@ -468,7 +468,7 @@ services:
       - no-new-privileges:true
 
   qbittorrent-exporter:
-    image: ${QBITTORRENT_EXPORTER_IMAGE:?QBITTORRENT_EXPORTER_IMAGE must come from the fixed image lock}
+    image: ${QBITTORRENT_EXPORTER_IMAGE:?QBITTORRENT_EXPORTER_IMAGE must name an explicit update channel}
     container_name: qbittorrent-exporter
     profiles:
       - torrent-integrations
@@ -510,7 +510,7 @@ services:
 
 
   alloy:
-    image: ${ALLOY_IMAGE:?ALLOY_IMAGE must come from the fixed image lock}
+    image: ${ALLOY_IMAGE:?ALLOY_IMAGE must name an explicit update channel}
     container_name: alloy
     profiles:
       - monitoring-ready
@@ -575,7 +575,7 @@ services:
       - no-new-privileges:true
 
   tdarr-server:
-    image: ${TDARR_SERVER_IMAGE:?TDARR_SERVER_IMAGE must come from the fixed image lock}
+    image: ${TDARR_SERVER_IMAGE:?TDARR_SERVER_IMAGE must name an explicit update channel}
     container_name: tdarr-server
     profiles:
       - media-conversion
@@ -613,7 +613,7 @@ services:
       - no-new-privileges:true
 
   tdarr-lenovo-node:
-    image: ${TDARR_NODE_IMAGE:?TDARR_NODE_IMAGE must come from the fixed image lock}
+    image: ${TDARR_NODE_IMAGE:?TDARR_NODE_IMAGE must name an explicit update channel}
     container_name: tdarr-lenovo-node
     profiles:
       - media-conversion

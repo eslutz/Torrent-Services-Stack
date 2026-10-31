@@ -66,3 +66,10 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
+def valid_image_reference(value):
+    """Require an explicit update channel or a captured recovery digest."""
+    return isinstance(value, str) and re.fullmatch(
+        r'[a-z0-9][a-z0-9._/-]*(?::[A-Za-z0-9_][A-Za-z0-9_.-]*|@sha256:[a-f0-9]{64})', value
+    ) is not None

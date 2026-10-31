@@ -106,8 +106,8 @@ sed -n '1p' "$key_file" | tr -d '\n' | grep -Eq '^[A-Za-z0-9+/]{43}=$' ||
 for variable in GLUETUN_IMAGE QBITTORRENT_IMAGE SONARR_IMAGE RADARR_IMAGE \
   PROWLARR_IMAGE BAZARR_IMAGE UNPACKERR_IMAGE QBITTORRENT_EXPORTER_IMAGE \
   SCRAPARR_IMAGE SEERR_IMAGE TORARR_IMAGE SWIPARR_IMAGE FLARESOLVERR_IMAGE; do
-  grep -Eq "^$variable=[a-z0-9./-]+@sha256:[a-f0-9]{64}$" "$image_lock" ||
-    fail "image lock entry is missing or not digest-pinned: $variable"
+  grep -Eq "^$variable=[a-z0-9._/-]+(:[A-Za-z0-9_][A-Za-z0-9_.-]*|@sha256:[a-f0-9]{64})$" "$image_lock" ||
+    fail "image lock entry is missing or lacks an explicit image channel: $variable"
 done
 
 for config in config/gluetun/gluetun.env config/gluetun/auth.toml \

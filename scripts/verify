@@ -38,7 +38,7 @@ with tempfile.TemporaryDirectory() as temporary:
     if 'Session\\Interface=tun0' not in qbt or 'WebUI\\LocalHostAuth=false' not in qbt:raise SystemExit('qBittorrent isolation/hook contract changed')
     lock=output/'etc/home-network/image-locks/torrent-services.env'
     for line in lock.read_text().splitlines():
-        if line and not re.fullmatch(r'[A-Z_]+=[a-z0-9./_-]+@sha256:[a-f0-9]{64}',line):raise SystemExit('image must be digest-pinned')
+        if line and ('=' not in line or not r.valid_image_reference(line.split('=', 1)[1])):raise SystemExit('image needs an explicit channel or recovery digest')
     if not shutil.which('docker'):raise SystemExit('Docker Compose is required for the full configuration gate')
     subprocess.run(['docker','compose','--env-file',str(lock),'-f',str(app/'compose.yaml'),'config','--no-env-resolution','--no-path-resolution','--quiet'],check=True)
 for path in [ROOT/'settings.example.json',ROOT/'stack_renderer.py',*(ROOT/'templates').rglob('*')]:
