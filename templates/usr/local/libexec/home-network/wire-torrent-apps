@@ -767,8 +767,6 @@ write_integrations_env() {
     printf 'RADARR_API_KEY=%s\n' "$(arr_key radarr)"
     printf 'PROWLARR_API_KEY=%s\n' "$(arr_key prowlarr)"
     printf 'BAZARR_API_KEY=%s\n' "$(bazarr_key)"
-    printf 'UN_SONARR_0_API_KEY=%s\n' "$(arr_key sonarr)"
-    printf 'UN_RADARR_0_API_KEY=%s\n' "$(arr_key radarr)"
   ) > "$tmp"
   chown root:root "$tmp"; chmod 0600 "$tmp"
   if [ -f "$integrations_env" ] && cmp -s "$tmp" "$integrations_env"; then

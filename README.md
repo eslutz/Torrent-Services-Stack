@@ -17,12 +17,13 @@ Reusable Linux media stack with pinned images, Proton WireGuard isolation, forwa
 
 Pinned image upgrades are reviewed changes. Do not replace locks with floating tags. Keep deployment authorization separate from source revisions. See NOTICE.md for provenance and upstream attribution.
 
-Unpackerr v1 requires native `unpackerr-ui-password` and `unpackerr-metrics-key`
-files in the configured secrets directory. Provision them before starting its
-integration profile; keep values out of Compose and Git. The UI password file
-contains `username:password`; the metrics key is 60–150 ASCII characters and is
-assigned only `system:metrics:read`. Files are read-only and readable by the
-configured media UID. Serve `/` on a dedicated HTTPS reverse-proxy hostname and
-scrape metrics through HTTPS with the dedicated key. The backend admits only
-the configured proxy hosts, so monitoring uses the proxy rather than the raw
-backend port.
+Unpackerr v1 settings are managed through its Web UI and persisted in the
+writable `config/unpackerr/` directory mounted at `/config`. Create that directory
+owned by the configured media UID before startup. Configure Starr integrations,
+login and metrics keys in the UI; existing deployments must migrate their values
+before dropping environment overrides. Do not attach the shared integration env
+file to Unpackerr or set `UN_*` settings: those lock fields in its UI. Its native
+config/history are private application state and must be included in encrypted
+backups, never Git. Serve `/` on a dedicated HTTPS reverse-proxy hostname and use
+a separate metrics-only key for HTTPS scrapes. The backend admits only the
+configured proxy hosts. Other exporters retain their own native credential files.
