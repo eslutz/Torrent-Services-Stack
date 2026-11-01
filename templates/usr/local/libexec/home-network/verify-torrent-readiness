@@ -150,11 +150,8 @@ runtime_conf="$compose_root/data/qbittorrent/qBittorrent/qBittorrent.conf"
 [ -f "$runtime_conf" ] || fail "qBittorrent configuration is not seeded: $runtime_conf (run seed-torrent-config)"
 [ "$(stat -c '%U:%G' "$runtime_conf")" = 'torrent-services:torrent-services' ] ||
   fail "qBittorrent configuration must be owned by torrent-services: $runtime_conf"
-grep -Fxq 'WebUI\LocalHostAuth=false' "$runtime_conf" ||
-  fail 'qBittorrent configuration must bypass authentication on loopback for the Gluetun port-forward hook'
-grep -Fq 'Session\DiskIOType=SimplePreadPwrite' "$runtime_conf" ||
-  fail 'qBittorrent configuration must set DiskIOType=SimplePreadPwrite (the name, not a number)'
-grep -Fq 'WebUI\ServerDomains="' "$runtime_conf" ||
-  fail 'qBittorrent ServerDomains must be quoted; an unquoted ; starts an INI comment and drops every name after the first'
+/usr/bin/python3 /usr/local/libexec/home-network/qbittorrent_runtime_config.py "$runtime_conf" ||
+  fail 'qBittorrent runtime authentication, disk I/O or domain settings are incompatible'
+
 
 printf 'torrent stack is ready\n'

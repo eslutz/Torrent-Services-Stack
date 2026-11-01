@@ -16,3 +16,13 @@ Reusable Linux media stack with pinned images, Proton WireGuard isolation, forwa
 8. Run `./scripts/verify`. Check container health, trusted HTTPS and proxy headers from a client, denial from a non-proxy source, mounts as the exact media UID, VPN egress/DNS isolation, forwarded-port synchronization, reconnection behavior, import Copy behavior and continued seeding. Capture a predecessor and rollback before any deployment update. Source checks alone do not prove these runtime properties.
 
 Pinned image upgrades are reviewed changes. Do not replace locks with floating tags. Keep deployment authorization separate from source revisions. See NOTICE.md for provenance and upstream attribution.
+
+Unpackerr v1 requires native `unpackerr-ui-password` and `unpackerr-metrics-key`
+files in the configured secrets directory. Provision them before starting its
+integration profile; keep values out of Compose and Git. The UI password file
+contains `username:password`; the metrics key is 60–150 ASCII characters and is
+assigned only `system:metrics:read`. Files are read-only and readable by the
+configured media UID. Serve `/unpackerr/` through an HTTPS reverse proxy and
+scrape metrics through HTTPS with the dedicated key. The backend admits only
+the configured proxy hosts, so monitoring uses the proxy rather than the raw
+backend port.
