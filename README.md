@@ -22,7 +22,7 @@ files in the configured secrets directory. Provision them before starting its
 integration profile; keep values out of Compose and Git. The UI password file
 contains `username:password`; the metrics key is 60–150 ASCII characters and is
 assigned only `system:metrics:read`. Files are read-only and readable by the
-configured media UID. Serve `/unpackerr/` through an HTTPS reverse proxy and
+configured media UID. Serve `/` on a dedicated HTTPS reverse-proxy hostname and
 scrape metrics through HTTPS with the dedicated key. The backend admits only
 the configured proxy hosts, so monitoring uses the proxy rather than the raw
 backend port.

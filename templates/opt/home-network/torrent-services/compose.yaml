@@ -396,7 +396,7 @@ services:
       UN_INTERVAL: 2m
       UN_WEBSERVER_METRICS: "true"
       UN_WEBSERVER_LISTEN_ADDR: 0.0.0.0:5656
-      UN_WEBSERVER_URLBASE: /unpackerr/
+      UN_WEBSERVER_URLBASE: /
       UN_WEBSERVER_UI_PASSWORD: filepath:/run/secrets/unpackerr-ui-password
       UN_WEBSERVER_API_KEYS_0_NAME: prometheus
       UN_WEBSERVER_API_KEYS_0_KEY: filepath:/run/secrets/unpackerr-metrics-key
@@ -421,7 +421,7 @@ services:
         - /usr/bin/wget
         - -q
         - --spider
-        - http://127.0.0.1:5656/unpackerr/
+        - http://127.0.0.1:5656/
       interval: 30s
       timeout: 10s
       retries: 10
