@@ -2,7 +2,7 @@
 
 [![Verify](https://github.com/eslutz/Torrent-Services-Stack/actions/workflows/ci.yml/badge.svg)](https://github.com/eslutz/Torrent-Services-Stack/actions/workflows/ci.yml)
 
-Reusable Linux media stack with pinned images, Proton WireGuard isolation, forwarded-port synchronization, mount guards, authenticated applications, bounded logs and optional exporters. Python tooling uses only the standard library. It works independently of private infrastructure repositories. The existing public Git history is preserved; `legacy/` is reference material and `v2/` is a preserved local experiment.
+Reusable Linux media stack with pinned images, Proton WireGuard isolation, forwarded-port synchronization, mount guards, authenticated applications, bounded logs and optional exporters. Python tooling uses only the standard library. It works independently of private infrastructure repositories. The existing public Git history is preserved.
 
 ## Setup
 
