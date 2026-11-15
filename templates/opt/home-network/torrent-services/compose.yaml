@@ -636,6 +636,56 @@ services:
     security_opt:
       - no-new-privileges:true
 
+  chaptarr:
+    image: ${CHAPTARR_IMAGE:?CHAPTARR_IMAGE must name an explicit stable update channel}
+    container_name: chaptarr
+    profiles: [books-ready]
+    restart: unless-stopped
+    ports:
+      - "${TORRENT_SERVICES_IP:-@@MEDIA_ADDRESS@@}:8789:8789"
+    environment:
+      PUID: "@@MEDIA_ID@@"
+      PGID: "@@MEDIA_ID@@"
+      UMASK: "002"
+      TZ: @@TIMEZONE@@
+      TMPDIR: /work
+    volumes:
+      - type: bind
+        source: @@APP_ROOT@@/torrent-services/data/chaptarr
+        target: /config
+        bind: {create_host_path: false}
+      - type: bind
+        source: @@LIBRARY_MOUNT@@/books
+        target: /data/books
+        bind: {create_host_path: false}
+      - type: bind
+        source: @@LIBRARY_MOUNT@@/audiobooks
+        target: /data/audiobooks
+        bind: {create_host_path: false}
+      - type: bind
+        source: @@STAGING_MOUNT@@
+        target: /staging
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: @@APP_ROOT@@/torrent-services/data/chaptarr-work
+        target: /work
+        bind: {create_host_path: false}
+      - type: bind
+        source: @@LIBRARY_MOUNT@@/.chaptarr-recycle
+        target: /recycle
+        bind: {create_host_path: false}
+    cpus: 2
+    mem_limit: 2g
+    logging: *media-logging
+    security_opt: [no-new-privileges:true]
+    healthcheck:
+      test: [CMD, /usr/bin/curl, --fail, --silent, http://127.0.0.1:8789/ping]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+
 secrets:
   wireguard_private_key:
     file: @@CONFIG_ROOT@@/secrets/proton-wireguard-private-key

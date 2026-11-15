@@ -1,0 +1,15 @@
+#!/bin/sh
+set -eu
+fail() { printf '%s\n' "$1" >&2; exit 69; }
+@@LIBEXEC_ROOT@@/verify-torrent-readiness >/dev/null
+for path in @@LIBRARY_MOUNT@@/books @@LIBRARY_MOUNT@@/audiobooks \
+  @@LIBRARY_MOUNT@@/.chaptarr-recycle @@STAGING_MOUNT@@/downloads/complete/chaptarr \
+  @@APP_ROOT@@/torrent-services/data/chaptarr @@APP_ROOT@@/torrent-services/data/chaptarr-work; do
+  [ ! -L "$path" ] || fail "Chaptarr path must not be a symlink: $path"
+  /usr/bin/setpriv --reuid=@@MEDIA_ID@@ --regid=@@MEDIA_ID@@ --clear-groups -- \
+    /bin/sh -c 'test -d "$1" && test -r "$1" && test -w "$1" && test -x "$1"' sh "$path" ||
+      fail "Chaptarr path is unavailable to the media identity: $path"
+done
+grep -Eq '^CHAPTARR_IMAGE=chaptarr/chaptarr(:[A-Za-z0-9_.-]+|@sha256:[a-f0-9]{64})$' \
+  @@CONFIG_ROOT@@/image-locks/torrent-services.env || fail 'Chaptarr image channel missing'
+printf 'Chaptarr mount, identity, storage and image gates pass.\n'

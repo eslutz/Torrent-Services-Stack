@@ -1,0 +1,25 @@
+#!/bin/sh
+set -eu
+[ "$(id -u)" -eq 0 ] || exit 69
+@@LIBEXEC_ROOT@@/verify-torrent-readiness >/dev/null
+umask 002
+install -d -o @@MEDIA_ID@@ -g @@MEDIA_ID@@ -m 0700 \
+  @@APP_ROOT@@/torrent-services/data/chaptarr \
+  @@APP_ROOT@@/torrent-services/data/chaptarr-work
+for path in books audiobooks .chaptarr-recycle; do
+  /usr/bin/setpriv --reuid=@@MEDIA_ID@@ --regid=@@MEDIA_ID@@ --clear-groups -- \
+    mkdir -p -m 2775 "@@LIBRARY_MOUNT@@/$path"
+done
+for library in books audiobooks; do
+  ignore="@@LIBRARY_MOUNT@@/$library/.ignore"
+  [ ! -L "$ignore" ] || { printf 'Unsafe ignore file\n' >&2; exit 69; }
+  if [ -e "$ignore" ]; then
+    grep -Fqx '**/.chaptarr-conversions/' "$ignore" || { printf 'Existing ignore policy needs review\n' >&2; exit 69; }
+  else
+    /usr/bin/setpriv --reuid=@@MEDIA_ID@@ --regid=@@MEDIA_ID@@ --clear-groups -- \
+      /bin/sh -c 'set -C; umask 002; printf "%s\n" "**/.chaptarr-conversions/" > "$1"' sh "$ignore"
+  fi
+done
+/usr/bin/setpriv --reuid=@@MEDIA_ID@@ --regid=@@MEDIA_ID@@ --clear-groups -- \
+  mkdir -p -m 0750 @@STAGING_MOUNT@@/downloads/complete/chaptarr
+printf 'Chaptarr private state and guarded book roots prepared. No service started.\n'

@@ -27,3 +27,14 @@ config/history are private application state and must be included in encrypted
 backups, never Git. Serve `/` on a dedicated HTTPS reverse-proxy hostname and use
 a separate metrics-only key for HTTPS scrapes. The backend admits only the
 configured proxy hosts. Other exporters retain their own native credential files.
+
+## Optional books service
+
+The `books-ready` profile adds one Chaptarr instance with separate ebook and
+audiobook roots. Its staging mount is read-only: completed imports and MP3-to-M4B
+conversion must copy sources and preserve torrent payloads. Native conversion is
+bounded to two CPUs and 2 GiB; configuration and temporary work stay on local
+storage. Run the explicit seed helper after mount checks, then the dedicated
+readiness helper before activation. Do not enable this profile on an existing
+installation without HTTPS, authentication, scoped backend ingress and recovery.
+Use the official stable channel; capture the actual installed image for rollback.
