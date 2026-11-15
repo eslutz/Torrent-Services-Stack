@@ -8,7 +8,7 @@ services:
     restart: unless-stopped
     mem_limit: 192m
     shm_size: 64m
-    command: [postgres, -c, shared_buffers=32MB, -c, max_connections=30]
+    command: [postgres, -c, shared_buffers=32MB, -c, max_connections=40]
     environment:
       POSTGRES_USER: jellystat
       POSTGRES_DB: jfstat

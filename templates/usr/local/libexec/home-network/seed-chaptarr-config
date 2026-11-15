@@ -6,9 +6,10 @@ umask 002
 install -d -o @@MEDIA_ID@@ -g @@MEDIA_ID@@ -m 0700 \
   @@APP_ROOT@@/torrent-services/data/chaptarr \
   @@APP_ROOT@@/torrent-services/data/chaptarr-work
+# The TrueNAS NFSv4 ACL must be inherited; chmod through this export is refused.
 for path in books audiobooks .chaptarr-recycle; do
   /usr/bin/setpriv --reuid=@@MEDIA_ID@@ --regid=@@MEDIA_ID@@ --clear-groups -- \
-    mkdir -p -m 2775 "@@LIBRARY_MOUNT@@/$path"
+    mkdir -p "@@LIBRARY_MOUNT@@/$path"
 done
 for library in books audiobooks; do
   ignore="@@LIBRARY_MOUNT@@/$library/.ignore"

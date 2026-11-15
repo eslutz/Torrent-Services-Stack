@@ -680,7 +680,7 @@ services:
     logging: *media-logging
     security_opt: [no-new-privileges:true]
     healthcheck:
-      test: [CMD, /usr/bin/curl, --fail, --silent, http://127.0.0.1:8789/ping]
+      test: [CMD, /usr/bin/wget, -q, -O, /dev/null, http://127.0.0.1:8789/ping]
       interval: 15s
       timeout: 5s
       retries: 12
